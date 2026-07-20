@@ -21,6 +21,7 @@ from .text_cache import (
 logger = get_logger(__name__)
 
 MAX_GETITEM_ATTEMPT = 5
+SELECTED_TASK_DATA_MODES = ("clean", "clean_and_randomized")
 
 
 def _normalize_task_name(task_name: str) -> str:
@@ -28,27 +29,66 @@ def _normalize_task_name(task_name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", task_name.strip().lower()).strip("_")
 
 
-def _raw_file_matches_task(raw_file_name: Any, normalized_task_name: str) -> bool:
-    """Match canonical RoboTwin task names against path components conservatively."""
-    if not isinstance(raw_file_name, str) or not raw_file_name.strip():
-        return False
+def _validate_selected_task_data_mode(
+    selected_task_data_mode: str,
+) -> Literal["clean", "clean_and_randomized"]:
+    if selected_task_data_mode not in SELECTED_TASK_DATA_MODES:
+        raise ValueError(
+            "`selected_task_data_mode` must be one of "
+            f"{list(SELECTED_TASK_DATA_MODES)}, got {selected_task_data_mode!r}."
+        )
+    return selected_task_data_mode
 
-    path_components = [
+
+def _component_contains_normalized_token(component: str, token: str) -> bool:
+    """Match a normalized token sequence without accepting partial words."""
+    return (
+        component == token
+        or component.startswith(f"{token}_")
+        or component.endswith(f"_{token}")
+        or f"_{token}_" in component
+    )
+
+
+def _normalized_raw_file_components(raw_file_name: Any) -> List[str]:
+    if not isinstance(raw_file_name, str) or not raw_file_name.strip():
+        return []
+
+    return [
         _normalize_task_name(component)
         for component in re.split(r"[/\\]+", raw_file_name)
         if component
     ]
-    accepted_components = {
-        normalized_task_name,
-        f"{normalized_task_name}_demo_clean",
-        f"{normalized_task_name}_demo_randomized",
-    }
+
+
+def _raw_file_matches_task(raw_file_name: Any, normalized_task_name: str) -> bool:
+    """Match a canonical RoboTwin task anywhere in a raw source path component."""
     return any(
-        component in accepted_components
-        or component.startswith(f"{normalized_task_name}_demo_clean_")
-        or component.startswith(f"{normalized_task_name}_demo_randomized_")
+        _component_contains_normalized_token(component, normalized_task_name)
+        for component in _normalized_raw_file_components(raw_file_name)
+    )
+
+
+def _raw_file_matches_selected_task_data_mode(
+    raw_file_name: Any,
+    selected_task_data_mode: Literal["clean", "clean_and_randomized"],
+) -> bool:
+    """Use raw source metadata to enforce clean-only selection when requested."""
+    selected_task_data_mode = _validate_selected_task_data_mode(selected_task_data_mode)
+    if selected_task_data_mode == "clean_and_randomized":
+        # Preserve the previous behavior: this mode does not restrict source phase.
+        return True
+
+    path_components = _normalized_raw_file_components(raw_file_name)
+    has_clean_marker = any(
+        _component_contains_normalized_token(component, "demo_clean")
         for component in path_components
     )
+    has_randomized_marker = any(
+        _component_contains_normalized_token(component, "demo_randomized")
+        for component in path_components
+    )
+    return has_clean_marker and not has_randomized_marker
 
 
 def _episode_instruction_tasks(
@@ -81,15 +121,17 @@ def _episode_instruction_tasks(
 def _select_episode_indices(
     meta: LeRobotDatasetMetadata,
     task_names: Optional[List[str]],
+    selected_task_data_mode: Literal["clean", "clean_and_randomized"] = "clean_and_randomized",
     task_text_embedding_cache_root: Optional[str] = None,
     text_embedding_context_len: int = 128,
     expected_episodes_per_task: Optional[int] = None,
 ) -> List[int]:
-    """Return episode indices whose metadata contains one of ``task_names``."""
+    """Return episode indices matching selected RoboTwin tasks and demo mode."""
     if task_names is None:
         return list(range(meta.total_episodes))
     if len(task_names) == 0:
         raise ValueError("`task_names` must be null (all tasks) or a non-empty list.")
+    selected_task_data_mode = _validate_selected_task_data_mode(selected_task_data_mode)
 
     requested_by_normalized = {}
     for task_name in task_names:
@@ -164,6 +206,9 @@ def _select_episode_indices(
         for normalized, original in requested_by_normalized.items():
             matches_task_metadata = bool(matched_metadata_tasks[normalized].intersection(episode_tasks))
             matches_raw_file = _raw_file_matches_task(episode.get("raw_file_name"), normalized)
+            matches_selected_data_mode = _raw_file_matches_selected_task_data_mode(
+                episode.get("raw_file_name"), selected_task_data_mode
+            )
             if cache_filenames_by_normalized_task is not None:
                 matches_selected_cache = bool(
                     cache_filenames_by_normalized_task[normalized].intersection(episode_cache_filenames)
@@ -172,11 +217,17 @@ def _select_episode_indices(
                     _raw_file_matches_task(episode.get("raw_file_name"), candidate)
                     for candidate in requested_by_normalized
                 )
-                matches_episode = matches_selected_cache and (
-                    matches_raw_file or not raw_file_identifies_selected_task
+                # Prompt embeddings identify the task; raw source metadata enforces the
+                # requested clean/randomized mode and disambiguates explicit task paths.
+                matches_episode = (
+                    matches_selected_cache
+                    and matches_selected_data_mode
+                    and (matches_raw_file or not raw_file_identifies_selected_task)
                 )
             else:
-                matches_episode = matches_task_metadata or matches_raw_file
+                matches_episode = matches_selected_data_mode and (
+                    matches_task_metadata or matches_raw_file
+                )
             if matches_episode:
                 episode_counts[original] += 1
                 include_episode = True
@@ -193,6 +244,7 @@ def _select_episode_indices(
         available = sorted(metadata_tasks_by_normalized)
         raise ValueError(
             f"No episodes matched requested task(s) {tasks_without_episodes} in {meta.root}. "
+            f"Selected task data mode: {selected_task_data_mode!r}. "
             "Selected-task matching uses low-level `task_index` instructions and their precomputed cache "
             "files, with canonical `raw_file_name` components as an additional disambiguator. "
             "It does not guess from instruction keywords. "
@@ -212,7 +264,8 @@ def _select_episode_indices(
         if unexpected_counts:
             raise ValueError(
                 f"Selected-task episode counts do not equal expected_episodes_per_task="
-                f"{expected_episodes_per_task}: {unexpected_counts}."
+                f"{expected_episodes_per_task} for selected_task_data_mode="
+                f"{selected_task_data_mode!r}: {unexpected_counts}."
             )
         if len(episode_indices) != sum(episode_counts.values()):
             raise ValueError(
@@ -221,11 +274,13 @@ def _select_episode_indices(
             )
 
     logger.info(
-        "Selected %d/%d episodes from %s for task_names=%s (per-task counts=%s)",
+        "Selected %d/%d episodes from %s for task_names=%s, "
+        "selected_task_data_mode=%s (per-task counts=%s)",
         len(episode_indices),
         meta.total_episodes,
         meta.root,
         list(task_names),
+        selected_task_data_mode,
         episode_counts,
     )
     return sorted(episode_indices)
@@ -248,6 +303,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         is_training_set: bool = False,
         seed: int = 42,
         task_names: Optional[List[str]] = None,
+        selected_task_data_mode: Literal["clean", "clean_and_randomized"] = "clean_and_randomized",
         task_text_embedding_cache_root: Optional[str] = None,
         text_embedding_context_len: int = 128,
         expected_episodes_per_task: Optional[int] = None,
@@ -314,6 +370,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             episode_indices = _select_episode_indices(
                 meta,
                 task_names,
+                selected_task_data_mode=selected_task_data_mode,
                 task_text_embedding_cache_root=task_text_embedding_cache_root,
                 text_embedding_context_len=text_embedding_context_len,
                 expected_episodes_per_task=expected_episodes_per_task,

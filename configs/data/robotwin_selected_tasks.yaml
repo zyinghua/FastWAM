@@ -2,9 +2,13 @@ defaults:
   - robotwin
   - _self_
 
-# FastWAM's released RoboTwin mixture has 50 clean + 500 randomized episodes
-# for every task. Fail early if filtering finds anything other than 550.
-expected_episodes_per_task: 550
+# Which demonstrations to use for the selected tasks:
+#   clean                 -> 50 demo_clean episodes per task
+#   clean_and_randomized  -> 50 demo_clean + 500 demo_randomized episodes per task
+selected_task_data_mode: clean
+# Keep this consistent with selected_task_data_mode for the released dataset
+# (50 for clean; 550 for clean_and_randomized). This is a fail-fast check.
+expected_episodes_per_task: 50
 dataset_root: /datasets/robotwin2.0-fastwam/robotwin2.0
 # This list is the only task selection to edit. The cache path for each task is
 # derived automatically as: ${data.text_embedding_cache_root}/<task_name>.
@@ -16,6 +20,7 @@ text_embedding_cache_root: /datasets/robotwin2.0-fastwam/text_embeds_cache
 
 train:
   task_names: ${data.selected_task_names}
+  selected_task_data_mode: ${data.selected_task_data_mode}
   task_text_embedding_cache_root: ${data.text_embedding_cache_root}
   expected_episodes_per_task: ${data.expected_episodes_per_task}
   dataset_dirs:
@@ -26,6 +31,7 @@ train:
 
 val:
   task_names: ${data.selected_task_names}
+  selected_task_data_mode: ${data.selected_task_data_mode}
   task_text_embedding_cache_root: ${data.text_embedding_cache_root}
   expected_episodes_per_task: ${data.expected_episodes_per_task}
   dataset_dirs:

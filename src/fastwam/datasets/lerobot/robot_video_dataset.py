@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Literal, Optional
 import time
 import numpy as np
 import traceback
@@ -46,6 +46,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
         task_names: Optional[List[str]] = None, # canonical task names to include; null keeps every task
+        selected_task_data_mode: Literal["clean", "clean_and_randomized"] = "clean_and_randomized",
         task_text_embedding_cache_root: Optional[str] = None,
         expected_episodes_per_task: Optional[int] = None,
     ):
@@ -58,6 +59,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             is_training_set=is_training_set,
             global_sample_stride=global_sample_stride,
             task_names=task_names,
+            selected_task_data_mode=selected_task_data_mode,
             task_text_embedding_cache_root=task_text_embedding_cache_root,
             text_embedding_context_len=context_len,
             expected_episodes_per_task=expected_episodes_per_task,
