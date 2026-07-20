@@ -1,6 +1,6 @@
-import hashlib
 import os
-from typing import Optional
+from pathlib import Path
+from typing import List, Optional
 import time
 import numpy as np
 import traceback
@@ -17,10 +17,13 @@ from ..dataset_utils import ResizeSmallestSideAspectPreserving, CenterCrop, Norm
 from fastwam.utils.logging_config import get_logger
 from fastwam.utils import misc, pytorch_utils
 from accelerate import PartialState
+from .text_cache import (
+    DEFAULT_PROMPT,
+    DEFAULT_TEXT_ENCODER_ID,
+    resolve_task_text_embedding_cache_dirs,
+    text_embedding_cache_filename,
+)
 logger = get_logger(__name__)
-
-
-DEFAULT_PROMPT = "A video recorded from a robot's point of view executing the following instruction: {task}"
 
 class RobotVideoDataset(torch.utils.data.Dataset):
     def __init__(
@@ -42,6 +45,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
+        task_names: Optional[List[str]] = None, # canonical task names to include; null keeps every task
+        task_text_embedding_cache_root: Optional[str] = None,
+        expected_episodes_per_task: Optional[int] = None,
     ):
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
@@ -51,6 +57,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             val_set_proportion=val_set_proportion,
             is_training_set=is_training_set,
             global_sample_stride=global_sample_stride,
+            task_names=task_names,
+            task_text_embedding_cache_root=task_text_embedding_cache_root,
+            text_embedding_context_len=context_len,
+            expected_episodes_per_task=expected_episodes_per_task,
         )
     
         self.num_frames = num_frames
@@ -68,6 +78,21 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.video_size = video_size
         self.text_embedding_cache_dir = text_embedding_cache_dir
         self.context_len = context_len
+        self._selected_text_embedding_cache_paths = None
+        if task_text_embedding_cache_root is not None:
+            self._selected_text_embedding_cache_paths = {}
+            filename_pattern = f"*.t5_len{self.context_len}.{DEFAULT_TEXT_ENCODER_ID}.pt"
+            selected_cache_dirs = resolve_task_text_embedding_cache_dirs(
+                task_names,
+                task_text_embedding_cache_root,
+            )
+            for task_name, cache_dir in selected_cache_dirs.items():
+                if not cache_dir.is_dir():
+                    raise FileNotFoundError(
+                        f"Text embedding cache directory for {task_name!r} does not exist: {cache_dir}"
+                    )
+                for cache_path in sorted(cache_dir.rglob(filename_pattern)):
+                    self._selected_text_embedding_cache_paths.setdefault(cache_path.name, cache_path)
         self.skip_padding_as_possible = skip_padding_as_possible
         self.max_padding_retry = max_padding_retry
         self.concat_multi_camera = concat_multi_camera
@@ -234,18 +259,23 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         return data
 
     def _get_cached_text_context(self, prompt: str):
-        if self.text_embedding_cache_dir is None:
-            raise ValueError("text_embedding_cache_dir is not set.")
-        cache_dir = self.text_embedding_cache_dir
-        os.makedirs(cache_dir, exist_ok=True)
-        hashed = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        cache_path = os.path.join(cache_dir, f"{hashed}.t5_len{self.context_len}.wan22ti2v5b.pt")
-        if not os.path.exists(cache_path):
+        cache_filename = text_embedding_cache_filename(prompt, context_len=self.context_len)
+        if self._selected_text_embedding_cache_paths is not None:
+            cache_path = self._selected_text_embedding_cache_paths.get(cache_filename)
+            searched_location = f"selected task cache directories ({len(self._selected_text_embedding_cache_paths)} files indexed)"
+        else:
+            if self.text_embedding_cache_dir is None:
+                raise ValueError("text_embedding_cache_dir is not set.")
+            cache_dir = Path(self.text_embedding_cache_dir)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_path = cache_dir / cache_filename
+            searched_location = str(cache_dir)
+        if cache_path is None or not cache_path.exists():
             raise FileNotFoundError(
-                f"Missing text embedding cache: {cache_path}. "
+                f"Missing text embedding cache {cache_filename} in {searched_location}. "
                 "Run scripts/precompute_text_embeds.py first."
             )
-        payload = torch.load(cache_path, map_location="cpu")
+        payload = torch.load(str(cache_path), map_location="cpu")
         context = payload["context"]
         context_mask = payload["mask"].bool()
         if context.ndim != 2:
