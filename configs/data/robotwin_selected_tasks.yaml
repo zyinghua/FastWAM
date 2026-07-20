@@ -5,6 +5,9 @@ defaults:
 # Which demonstrations to use for the selected tasks:
 #   clean                 -> 50 demo_clean episodes per task
 #   clean_and_randomized  -> 50 demo_clean + 500 demo_randomized episodes per task
+# The released archive omits source-path labels. For clean mode, the loader
+# verifies its official 27,500-episode layout (550 contiguous episodes/task)
+# before taking the first 50 clean episodes from each selected task block.
 selected_task_data_mode: clean
 # Keep this consistent with selected_task_data_mode for the released dataset
 # (50 for clean; 550 for clean_and_randomized). This is a fail-fast check.

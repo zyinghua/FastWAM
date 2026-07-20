@@ -22,6 +22,16 @@ logger = get_logger(__name__)
 
 MAX_GETITEM_ATTEMPT = 5
 SELECTED_TASK_DATA_MODES = ("clean", "clean_and_randomized")
+ROBOTWIN_FASTWAM_NUM_TASKS = 50
+ROBOTWIN_FASTWAM_CLEAN_EPISODES_PER_TASK = 50
+ROBOTWIN_FASTWAM_RANDOMIZED_EPISODES_PER_TASK = 500
+ROBOTWIN_FASTWAM_EPISODES_PER_TASK = (
+    ROBOTWIN_FASTWAM_CLEAN_EPISODES_PER_TASK
+    + ROBOTWIN_FASTWAM_RANDOMIZED_EPISODES_PER_TASK
+)
+ROBOTWIN_FASTWAM_TOTAL_EPISODES = (
+    ROBOTWIN_FASTWAM_NUM_TASKS * ROBOTWIN_FASTWAM_EPISODES_PER_TASK
+)
 
 
 def _normalize_task_name(task_name: str) -> str:
@@ -89,6 +99,93 @@ def _raw_file_matches_selected_task_data_mode(
         for component in path_components
     )
     return has_clean_marker and not has_randomized_marker
+
+
+def _select_task_episode_indices_for_data_mode(
+    meta: LeRobotDatasetMetadata,
+    episode_indices_by_task: Dict[str, List[int]],
+    selected_task_data_mode: Literal["clean", "clean_and_randomized"],
+) -> tuple[Dict[str, List[int]], str]:
+    """Apply the demo-phase filter after task identity has been resolved.
+
+    Newer/custom conversions may preserve the source path in ``raw_file_name``.
+    The released 27,500-episode FastWAM archive does not. That archive stores 50
+    task-aligned blocks of 550 episodes, ordered as 50 ``demo_clean`` followed by
+    500 ``demo_randomized`` episodes. The fallback below checks the complete
+    layout before relying on that ordering, so it cannot silently select the
+    first 50 episodes from an unknown or reordered dataset.
+    """
+    selected_task_data_mode = _validate_selected_task_data_mode(selected_task_data_mode)
+    if selected_task_data_mode == "clean_and_randomized":
+        return {
+            task_name: sorted(episode_indices)
+            for task_name, episode_indices in episode_indices_by_task.items()
+        }, "all matched task episodes"
+
+    candidate_indices = sorted(
+        episode_index
+        for episode_indices in episode_indices_by_task.values()
+        for episode_index in episode_indices
+    )
+    raw_file_presence = [
+        isinstance(meta.episodes[episode_index].get("raw_file_name"), str)
+        and bool(meta.episodes[episode_index]["raw_file_name"].strip())
+        for episode_index in candidate_indices
+    ]
+
+    if raw_file_presence and all(raw_file_presence):
+        selected = {
+            task_name: [
+                episode_index
+                for episode_index in sorted(episode_indices)
+                if _raw_file_matches_selected_task_data_mode(
+                    meta.episodes[episode_index].get("raw_file_name"), "clean"
+                )
+            ]
+            for task_name, episode_indices in episode_indices_by_task.items()
+        }
+        return selected, "raw_file_name demo phase"
+
+    if any(raw_file_presence):
+        raise ValueError(
+            "Only some matched episodes contain `raw_file_name`; refusing to mix "
+            "source-path phase labels with an ordering fallback."
+        )
+
+    if meta.total_episodes != ROBOTWIN_FASTWAM_TOTAL_EPISODES:
+        raise ValueError(
+            "Clean-only selection requires either `raw_file_name` phase metadata or "
+            "the verified released FastWAM RoboTwin layout. The dataset has no "
+            f"`raw_file_name` and contains {meta.total_episodes} episodes instead of "
+            f"{ROBOTWIN_FASTWAM_TOTAL_EPISODES}."
+        )
+
+    selected: Dict[str, List[int]] = {}
+    for task_name, episode_indices in episode_indices_by_task.items():
+        ordered = sorted(episode_indices)
+        if len(ordered) != ROBOTWIN_FASTWAM_EPISODES_PER_TASK:
+            raise ValueError(
+                "The released-layout clean fallback expected "
+                f"{ROBOTWIN_FASTWAM_EPISODES_PER_TASK} matched episodes for "
+                f"{task_name!r}, got {len(ordered)}."
+            )
+        block_start = ordered[0]
+        expected_block = list(
+            range(block_start, block_start + ROBOTWIN_FASTWAM_EPISODES_PER_TASK)
+        )
+        if (
+            block_start % ROBOTWIN_FASTWAM_EPISODES_PER_TASK != 0
+            or ordered != expected_block
+        ):
+            raise ValueError(
+                "The released-layout clean fallback requires each task to occupy one "
+                f"aligned contiguous block of {ROBOTWIN_FASTWAM_EPISODES_PER_TASK} "
+                f"episodes. Task {task_name!r} matched indices beginning at "
+                f"{ordered[:10]}; refusing to infer the demo phase."
+            )
+        selected[task_name] = ordered[:ROBOTWIN_FASTWAM_CLEAN_EPISODES_PER_TASK]
+
+    return selected, "released archive order (50 clean, then 500 randomized)"
 
 
 def _episode_instruction_tasks(
@@ -190,8 +287,9 @@ def _select_episode_indices(
         normalized: set(metadata_tasks_by_normalized.get(normalized, []))
         for normalized in requested_by_normalized
     }
-    episode_counts = {original: 0 for original in requested_by_normalized.values()}
-    episode_indices = []
+    episode_indices_by_task = {
+        original: [] for original in requested_by_normalized.values()
+    }
     for episode_index, episode in meta.episodes.items():
         episode_tasks = set(episode.get("tasks", []))
         episode_instruction_tasks = _episode_instruction_tasks(meta, episode_index, episode)
@@ -202,13 +300,10 @@ def _select_episode_indices(
             )
             for episode_task in episode_instruction_tasks
         }
-        include_episode = False
+        matched_requested_tasks = []
         for normalized, original in requested_by_normalized.items():
             matches_task_metadata = bool(matched_metadata_tasks[normalized].intersection(episode_tasks))
             matches_raw_file = _raw_file_matches_task(episode.get("raw_file_name"), normalized)
-            matches_selected_data_mode = _raw_file_matches_selected_task_data_mode(
-                episode.get("raw_file_name"), selected_task_data_mode
-            )
             if cache_filenames_by_normalized_task is not None:
                 matches_selected_cache = bool(
                     cache_filenames_by_normalized_task[normalized].intersection(episode_cache_filenames)
@@ -217,24 +312,30 @@ def _select_episode_indices(
                     _raw_file_matches_task(episode.get("raw_file_name"), candidate)
                     for candidate in requested_by_normalized
                 )
-                # Prompt embeddings identify the task; raw source metadata enforces the
-                # requested clean/randomized mode and disambiguates explicit task paths.
+                # Prompt embeddings identify the task. A source path, when present,
+                # additionally disambiguates explicit task directories.
                 matches_episode = (
                     matches_selected_cache
-                    and matches_selected_data_mode
                     and (matches_raw_file or not raw_file_identifies_selected_task)
                 )
             else:
-                matches_episode = matches_selected_data_mode and (
-                    matches_task_metadata or matches_raw_file
-                )
+                matches_episode = matches_task_metadata or matches_raw_file
             if matches_episode:
-                episode_counts[original] += 1
-                include_episode = True
-        if include_episode:
-            episode_indices.append(episode_index)
+                matched_requested_tasks.append(original)
 
-    tasks_without_episodes = [task_name for task_name, count in episode_counts.items() if count == 0]
+        if len(matched_requested_tasks) > 1:
+            raise ValueError(
+                f"Episode {episode_index} matched multiple selected task names "
+                f"{matched_requested_tasks}; refusing an ambiguous selection."
+            )
+        if matched_requested_tasks:
+            episode_indices_by_task[matched_requested_tasks[0]].append(episode_index)
+
+    tasks_without_episodes = [
+        task_name
+        for task_name, episode_indices in episode_indices_by_task.items()
+        if not episode_indices
+    ]
     if tasks_without_episodes:
         raw_file_examples = [
             episode.get("raw_file_name")
@@ -251,6 +352,32 @@ def _select_episode_indices(
             f"Available normalized metadata tasks include: {available[:50]}. "
             f"Example raw_file_name values: {raw_file_examples}"
         )
+
+    episode_indices_by_task, data_mode_source = _select_task_episode_indices_for_data_mode(
+        meta,
+        episode_indices_by_task,
+        selected_task_data_mode,
+    )
+    episode_counts = {
+        task_name: len(episode_indices)
+        for task_name, episode_indices in episode_indices_by_task.items()
+    }
+    episode_indices = sorted(
+        episode_index
+        for task_episode_indices in episode_indices_by_task.values()
+        for episode_index in task_episode_indices
+    )
+
+    tasks_without_episodes = [
+        task_name for task_name, count in episode_counts.items() if count == 0
+    ]
+    if tasks_without_episodes:
+        raise ValueError(
+            f"No episodes remained for requested task(s) {tasks_without_episodes} after "
+            f"applying selected_task_data_mode={selected_task_data_mode!r} via "
+            f"{data_mode_source}."
+        )
+
     if expected_episodes_per_task is not None:
         if expected_episodes_per_task <= 0:
             raise ValueError(
@@ -267,23 +394,19 @@ def _select_episode_indices(
                 f"{expected_episodes_per_task} for selected_task_data_mode="
                 f"{selected_task_data_mode!r}: {unexpected_counts}."
             )
-        if len(episode_indices) != sum(episode_counts.values()):
-            raise ValueError(
-                "At least one episode matched multiple selected task names; refusing an ambiguous selection. "
-                f"Unique episodes={len(episode_indices)}, per-task counts={episode_counts}."
-            )
 
     logger.info(
         "Selected %d/%d episodes from %s for task_names=%s, "
-        "selected_task_data_mode=%s (per-task counts=%s)",
+        "selected_task_data_mode=%s via %s (per-task counts=%s)",
         len(episode_indices),
         meta.total_episodes,
         meta.root,
         list(task_names),
         selected_task_data_mode,
+        data_mode_source,
         episode_counts,
     )
-    return sorted(episode_indices)
+    return episode_indices
 
 
 class BaseLerobotDataset(torch.utils.data.Dataset):
