@@ -22,5 +22,6 @@ text_cfg_scale: 1.0
 negative_prompt: ""
 rand_device: cpu
 tiled: false
+# Per-episode model-call latency, matching RollingWAM's replan timing report.
 timing_enabled: false
 skip_get_obs_within_replan: false

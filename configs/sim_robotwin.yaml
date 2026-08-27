@@ -31,6 +31,7 @@ EVALUATION:
   negative_prompt: ""
   rand_device: cpu
   tiled: false
+  # Per-episode model-call latency: first replan, then mean/min/max of later replans.
   timing_enabled: false
   skip_get_obs_within_replan: true
 

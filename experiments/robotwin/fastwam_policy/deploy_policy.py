@@ -1,3 +1,4 @@
+import atexit
 import logging
 import os
 import sys
@@ -28,6 +29,7 @@ from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 def _is_none_like(value: Any) -> bool:
@@ -183,6 +185,9 @@ class WorldActionRobotWinPolicy:
         self.episode_count = 0
         self.step_count = 0
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
+        self._replan_times: list[float] = []
+        if self.timing_enabled:
+            atexit.register(self._log_replan_timing)
 
         logger.info(
             "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | horizon=%d | replan=%d",
@@ -258,7 +263,10 @@ class WorldActionRobotWinPolicy:
         with torch.no_grad():
             pred = self.model.infer_action(**infer_kwargs)
         if self.timing_enabled:
-            self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
+            # infer_action returns CPU actions, so their GPU computation has finished.
+            infer_elapsed = time.perf_counter() - infer_t0
+            self._timing_rollout["infer_s"] += infer_elapsed
+            self._replan_times.append(infer_elapsed)
 
         action_tensor = pred["action"]  # [T, D]
         action_chunk = self._denormalize_action(action_tensor)[0]  # [T, D]
@@ -304,8 +312,26 @@ class WorldActionRobotWinPolicy:
             "sim_s": float(self._timing_rollout["sim_s"]),
         }
 
+    def _log_replan_timing(self) -> None:
+        """Match RollingWAM's episode summary; flush the last episode at normal exit."""
+        if not self._replan_times:
+            return
+        # Separate the first call (which may include warmup) from subsequent calls.
+        # Unlike RollingWAM's init phase, FastWAM uses the full sampler every time.
+        init_s, steady = self._replan_times[0], self._replan_times[1:]
+        logger.info(
+            "Replan timing | init %.3fs | steady mean %.3fs min %.3fs max %.3fs (n=%d)",
+            init_s,
+            sum(steady) / len(steady) if steady else float("nan"),
+            min(steady) if steady else float("nan"),
+            max(steady) if steady else float("nan"),
+            len(steady),
+        )
+        self._replan_times = []
+
     def reset(self) -> None:
         self.pending_actions.clear()
+        self._log_replan_timing()
         self.episode_count += 1
         self.step_count = 0
         self.reset_timing_rollout()
