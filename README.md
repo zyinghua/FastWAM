@@ -226,6 +226,12 @@ Set it to `false` if you want to save a fully rendered video.
 
 ### 1) Precompute T5 embedding cache before training
 
+Existing caches can be either padded to `context_len` (128 by default) or
+padding-trimmed, such as `text_embeds_cache_trimmed`. The dataset loader restores
+trailing zero embeddings and a false padding mask in memory, retaining the
+existing model-input behavior. Keep `context_len=128` for `t5_len128` files;
+no cache rewriting, embedding recomputation, or extra flag is needed.
+
 Use `scripts/precompute_text_embeds.py` to precompute embeddings for each training task:
 
 ```bash

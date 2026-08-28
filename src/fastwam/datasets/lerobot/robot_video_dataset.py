@@ -261,6 +261,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         return data
 
     def _get_cached_text_context(self, prompt: str):
+        """Read padded or padding-trimmed caches without modifying the cache."""
         cache_filename = text_embedding_cache_filename(prompt, context_len=self.context_len)
         if self._selected_text_embedding_cache_paths is not None:
             cache_path = self._selected_text_embedding_cache_paths.get(cache_filename)
@@ -269,7 +270,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             if self.text_embedding_cache_dir is None:
                 raise ValueError("text_embedding_cache_dir is not set.")
             cache_dir = Path(self.text_embedding_cache_dir)
-            cache_dir.mkdir(parents=True, exist_ok=True)
             cache_path = cache_dir / cache_filename
             searched_location = str(cache_dir)
         if cache_path is None or not cache_path.exists():
@@ -288,14 +288,27 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             raise ValueError(
                 f"Cached `mask` must be 1D [L], got shape {tuple(context_mask.shape)} in {cache_path}"
             )
-        if context.shape[0] != self.context_len:
+        if context.shape[0] != context_mask.shape[0]:
             raise ValueError(
-                f"Cached context_len mismatch: expected {self.context_len}, got {context.shape[0]} in {cache_path}"
+                f"Cached context/mask length mismatch: {context.shape[0]} vs "
+                f"{context_mask.shape[0]} in {cache_path}"
             )
-        if context_mask.shape[0] != self.context_len:
+        if context.shape[0] > self.context_len:
             raise ValueError(
-                f"Cached mask_len mismatch: expected {self.context_len}, got {context_mask.shape[0]} in {cache_path}"
+                f"Cached context_len {context.shape[0]} exceeds expected "
+                f"{self.context_len} in {cache_path}"
             )
+
+        # t5_len<N> in the filename names the target length, even when trailing
+        # padding was omitted on disk. Restore it in memory only. _get() still
+        # zeroes masked rows and replaces the mask with ones, as before.
+        stored_len = context.shape[0]
+        if stored_len < self.context_len:
+            padded_context = context.new_zeros((self.context_len, context.shape[1]))
+            padded_context[:stored_len] = context
+            padded_mask = context_mask.new_zeros((self.context_len,))
+            padded_mask[:stored_len] = context_mask
+            context, context_mask = padded_context, padded_mask
 
         return context, context_mask
 
