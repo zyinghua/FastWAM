@@ -86,15 +86,16 @@ RESULT_DIR="$(cd "$RESULT_DIR" && pwd -P)"
 cd "$REPO_ROOT"
 
 echo "FastWAM timing sweep: task=$TASK_NAME episodes=$EPISODES seed=$SEED gpu=$GPU_ID"
-echo "Schedule: K=floor(16/W); horizon=16*W; joint_video_frames=4*W+1"
+echo "Schedule: K=floor(16/W); matched total S=W*K; horizon=16*W; joint_video_frames=4*W+1"
 echo "Checkpoint shared by both paths: $FASTWAM_CKPT"
 echo "Results: $RESULT_DIR"
 
 for window in {1..8}; do
-  inference_steps=$((16 / window))
+  steady_steps=$((16 / window))
+  total_steps=$((window * steady_steps))
   action_horizon=$((16 * window))
   num_video_frames=$((4 * window + 1))
-  run_name="w${window}_h${action_horizon}_k${inference_steps}"
+  run_name="w${window}_h${action_horizon}_s${total_steps}"
 
   fastwam_json="$RESULT_DIR/fastwam/$run_name.json"
   fastwam_log="$RESULT_DIR/fastwam/$run_name.log"
@@ -114,7 +115,7 @@ for window in {1..8}; do
     "EVALUATION.eval_num_episodes=$EPISODES"
     "EVALUATION.action_horizon=$action_horizon"
     EVALUATION.replan_steps=16
-    "EVALUATION.num_inference_steps=$inference_steps"
+    "EVALUATION.num_inference_steps=$total_steps"
     EVALUATION.timing_enabled=true
     EVALUATION.skip_get_obs_within_replan=true
     "seed=$SEED"
@@ -134,7 +135,7 @@ for window in {1..8}; do
     "EVALUATION.action_horizon=$action_horizon"
     "EVALUATION.num_video_frames=$num_video_frames"
     EVALUATION.replan_steps=16
-    "EVALUATION.num_inference_steps=$inference_steps"
+    "EVALUATION.num_inference_steps=$total_steps"
     EVALUATION.timing_enabled=true
     EVALUATION.skip_get_obs_within_replan=true
     "seed=$SEED"
@@ -143,7 +144,7 @@ for window in {1..8}; do
   )
 
   echo
-  echo "[FastWAM W=$window] horizon=$action_horizon steps=$inference_steps"
+  echo "[FastWAM W=$window] horizon=$action_horizon matched_total_steps=$total_steps"
   printf '  '
   printf '%q ' env \
     "DIFFSYNTH_MODEL_BASE_PATH=$MODEL_BASE_PATH" \
@@ -165,7 +166,7 @@ for window in {1..8}; do
   fi
 
   echo
-  echo "[FastWAM-Joint proxy W=$window] horizon=$action_horizon video_frames=$num_video_frames steps=$inference_steps"
+  echo "[FastWAM-Joint proxy W=$window] horizon=$action_horizon video_frames=$num_video_frames matched_total_steps=$total_steps"
   printf '  '
   printf '%q ' env \
     "DIFFSYNTH_MODEL_BASE_PATH=$MODEL_BASE_PATH" \
@@ -202,7 +203,7 @@ result_dir = Path(sys.argv[1])
 task_name = sys.argv[2]
 episodes = int(sys.argv[3])
 seed = int(sys.argv[4])
-step_schedule = [16, 8, 5, 4, 3, 2, 2, 2]
+total_step_schedule = [window * (16 // window) for window in range(1, 9)]
 
 
 def require_equal(actual, expected, label):
@@ -228,10 +229,11 @@ def ratio(numerator, denominator):
 
 runs = []
 shared_checkpoint = None
-for window, inference_steps in enumerate(step_schedule, start=1):
+for window, total_steps in enumerate(total_step_schedule, start=1):
     action_horizon = 16 * window
     num_video_frames = 4 * window + 1
-    run_name = f"w{window}_h{action_horizon}_k{inference_steps}"
+    rolling_steady_steps = 16 // window
+    run_name = f"w{window}_h{action_horizon}_s{total_steps}"
     fastwam_path = result_dir / "fastwam" / f"{run_name}.json"
     joint_path = result_dir / "fastwam_joint" / f"{run_name}.json"
     fastwam = read_result(fastwam_path)
@@ -241,16 +243,16 @@ for window, inference_steps in enumerate(step_schedule, start=1):
     require_equal(fastwam.get("model", {}).get("class"), "FastWAM", f"W={window} FastWAM class")
     require_equal(fastwam.get("model", {}).get("action_horizon"), action_horizon, f"W={window} FastWAM horizon")
     require_equal(fastwam.get("model", {}).get("executed_actions_per_replan"), 16, f"W={window} FastWAM executed actions")
-    require_equal(fastwam.get("model", {}).get("num_inference_steps"), inference_steps, f"W={window} FastWAM steps")
-    require_equal(fastwam.get("model", {}).get("denoising_steps_per_replan"), inference_steps, f"W={window} FastWAM denoising steps")
+    require_equal(fastwam.get("model", {}).get("num_inference_steps"), total_steps, f"W={window} FastWAM steps")
+    require_equal(fastwam.get("model", {}).get("denoising_steps_per_replan"), total_steps, f"W={window} FastWAM denoising steps")
 
     require_equal(joint.get("policy"), "fastwam", f"W={window} FastWAM-Joint policy")
     require_equal(joint.get("model", {}).get("class"), "FastWAMJoint", f"W={window} FastWAM-Joint class")
     require_equal(joint.get("model", {}).get("action_horizon"), action_horizon, f"W={window} FastWAM-Joint horizon")
     require_equal(joint.get("model", {}).get("num_video_frames"), num_video_frames, f"W={window} FastWAM-Joint video frames")
     require_equal(joint.get("model", {}).get("executed_actions_per_replan"), 16, f"W={window} FastWAM-Joint executed actions")
-    require_equal(joint.get("model", {}).get("num_inference_steps"), inference_steps, f"W={window} FastWAM-Joint steps")
-    require_equal(joint.get("model", {}).get("denoising_steps_per_replan"), inference_steps, f"W={window} FastWAM-Joint denoising steps")
+    require_equal(joint.get("model", {}).get("num_inference_steps"), total_steps, f"W={window} FastWAM-Joint steps")
+    require_equal(joint.get("model", {}).get("denoising_steps_per_replan"), total_steps, f"W={window} FastWAM-Joint denoising steps")
     require_equal(joint.get("checkpoint"), fastwam.get("checkpoint"), f"W={window} shared checkpoint")
     if shared_checkpoint is None:
         shared_checkpoint = fastwam.get("checkpoint")
@@ -265,7 +267,8 @@ for window, inference_steps in enumerate(step_schedule, start=1):
         {
             "equivalent_window_blocks": window,
             "action_horizon": action_horizon,
-            "num_inference_steps": inference_steps,
+            "rolling_steady_steps_per_replan": rolling_steady_steps,
+            "matched_total_inference_steps": total_steps,
             "fastwam": {
                 "result_file": str(fastwam_path.relative_to(result_dir)),
                 "model": fastwam.get("model"),
@@ -282,17 +285,17 @@ for window, inference_steps in enumerate(step_schedule, start=1):
                 "fastwam_joint_mean_ms": joint_mean,
                 "fastwam_joint_slowdown_vs_fastwam": ratio(joint_mean, fastwam_mean),
                 "fastwam_ms_per_denoiser_call": (
-                    None if fastwam_mean is None else fastwam_mean / inference_steps
+                    None if fastwam_mean is None else fastwam_mean / total_steps
                 ),
                 "fastwam_joint_ms_per_denoiser_call": (
-                    None if joint_mean is None else joint_mean / inference_steps
+                    None if joint_mean is None else joint_mean / total_steps
                 ),
             },
         }
     )
 
 summary = {
-    "schema_version": 1,
+    "schema_version": 2,
     "comparison": "fastwam_vs_fastwam_joint_proxy",
     "unit": "ms",
     "task": task_name,
@@ -300,7 +303,7 @@ summary = {
     "seed": seed,
     "checkpoint": shared_checkpoint,
     "executed_actions_per_replan": 16,
-    "schedule_rule": "K=floor(16/W); both FastWAM variants use S=K",
+    "schedule_rule": "K=floor(16/W); matched total S=W*K; both FastWAM variants use S denoising passes per replan",
     "fastwam_joint_weights": "FastWAM-trained checkpoint; timing proxy only",
     "runs": runs,
 }
