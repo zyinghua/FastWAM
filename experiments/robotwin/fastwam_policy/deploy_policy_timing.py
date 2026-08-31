@@ -1,4 +1,5 @@
 import atexit
+import json
 import logging
 import os
 import sys
@@ -62,6 +63,25 @@ def _parse_optional_float(value: Any) -> Optional[float]:
     if _is_none_like(value):
         return None
     return float(value)
+
+
+def _timing_stats_ms(values: list[float]) -> Dict[str, Any]:
+    if not values:
+        return {
+            "count": 0,
+            "mean_ms": None,
+            "std_ms": None,
+            "min_ms": None,
+            "max_ms": None,
+        }
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "count": int(array.size),
+        "mean_ms": float(array.mean()),
+        "std_ms": float(array.std()),
+        "min_ms": float(array.min()),
+        "max_ms": float(array.max()),
+    }
 
 
 def _normalize_mixed_precision(mixed_precision: str) -> str:
@@ -157,11 +177,22 @@ class WorldActionRobotWinPolicy:
         tiled: bool,
         timing_enabled: bool,
         num_video_frames: int,
+        timing_result_path: Optional[Path] = None,
+        timing_task_name: Optional[str] = None,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
 
         self.model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=device)
+        expected_model_class = os.environ.get("FASTWAM_TIMING_EXPECTED_MODEL_CLASS")
+        if (
+            expected_model_class is not None
+            and type(self.model).__name__ != expected_model_class
+        ):
+            raise ValueError(
+                "Timing run expected model class "
+                f"{expected_model_class}, but instantiated {type(self.model).__name__}"
+            )
         self.model.load_checkpoint(checkpoint_path)
         self.model = self.model.to(device).eval()
 
@@ -180,6 +211,9 @@ class WorldActionRobotWinPolicy:
         self.tiled = bool(tiled)
         self.timing_enabled = bool(timing_enabled)
         self._num_video_frames = int(num_video_frames)
+        self.checkpoint_path = str(Path(checkpoint_path).expanduser().resolve())
+        self.timing_task_name = timing_task_name
+        self.timing_result_path = timing_result_path
         if self.timing_enabled:
             # The deployment model is already in eval mode; avoid traversing it again per replan.
             self.model.eval = lambda: self.model
@@ -189,10 +223,14 @@ class WorldActionRobotWinPolicy:
         self.step_count = 0
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
         self._replan_times: list[float] = []
+        self._timing_records: list[Dict[str, Any]] = []
         self._timing_warmed_up = False
         self._prompt_cache: Optional[tuple[str, tuple[torch.Tensor, torch.Tensor]]] = None
         if self.timing_enabled:
             atexit.register(self._log_replan_timing)
+            if self.timing_result_path is not None:
+                self.timing_result_path.parent.mkdir(parents=True, exist_ok=True)
+                logger.info("Replan timing JSON | %s", self.timing_result_path)
 
         logger.info(
             "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | horizon=%d | replan=%d",
@@ -339,18 +377,72 @@ class WorldActionRobotWinPolicy:
         if not self._replan_times:
             return
         init_s, steady = self._replan_times[0], self._replan_times[1:]
+        init_ms = init_s * 1000.0
+        steady_ms = [value * 1000.0 for value in steady]
+        steady_stats = _timing_stats_ms(steady_ms)
         logger.info(
             "Replan timing | initialization %.3f ms | "
             "steady-state mean %.3f ms min %.3f ms max %.3f ms "
             "(n=%d) | total replans=%d",
-            init_s * 1000.0,
-            1000.0 * sum(steady) / len(steady) if steady else float("nan"),
-            1000.0 * min(steady) if steady else float("nan"),
-            1000.0 * max(steady) if steady else float("nan"),
+            init_ms,
+            steady_stats["mean_ms"] if steady else float("nan"),
+            steady_stats["min_ms"] if steady else float("nan"),
+            steady_stats["max_ms"] if steady else float("nan"),
             len(steady),
             len(self._replan_times),
         )
+        self._timing_records.append(
+            {
+                "episode": self.episode_count,
+                "initialization_ms": init_ms,
+                "steady_state_ms": steady_ms,
+                "steady_state": steady_stats,
+                "total_replans": len(self._replan_times),
+            }
+        )
+        self._write_timing_results()
         self._replan_times = []
+
+    def _write_timing_results(self) -> None:
+        if self.timing_result_path is None:
+            return
+        initialization_ms = [record["initialization_ms"] for record in self._timing_records]
+        steady_ms = [
+            value
+            for record in self._timing_records
+            for value in record["steady_state_ms"]
+        ]
+        result = {
+            "schema_version": 1,
+            "policy": "fastwam",
+            "unit": "ms",
+            "task_name": self.timing_task_name,
+            "checkpoint": self.checkpoint_path,
+            "model": {
+                "class": type(self.model).__name__,
+                "action_horizon": self.action_horizon,
+                "emitted_actions_per_replan": self.action_horizon,
+                "executed_actions_per_replan": self.replan_steps,
+                "num_inference_steps": self.num_inference_steps,
+                "denoising_steps_per_replan": self.num_inference_steps,
+                "num_video_frames": self._num_video_frames,
+            },
+            "episodes": self._timing_records,
+            "aggregate": {
+                "episodes": len(self._timing_records),
+                "initialization": _timing_stats_ms(initialization_ms),
+                "steady_state": _timing_stats_ms(steady_ms),
+                "total_replans": sum(record["total_replans"] for record in self._timing_records),
+            },
+        }
+        temporary_path = self.timing_result_path.with_suffix(
+            self.timing_result_path.suffix + ".tmp"
+        )
+        temporary_path.write_text(
+            json.dumps(result, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        temporary_path.replace(self.timing_result_path)
 
     def reset(self) -> None:
         self.pending_actions.clear()
@@ -397,6 +489,23 @@ def get_model(usr_args: Dict[str, Any]):
     if action_horizon <= 0:
         raise ValueError(f"`action_horizon` must be positive, got {action_horizon}")
 
+    num_video_frames = _parse_optional_int(usr_args.get("num_video_frames"))
+    if num_video_frames is None:
+        eval_num_video_frames = _parse_optional_int(
+            cfg.EVALUATION.get("num_video_frames")
+        )
+        num_video_frames = (
+            eval_num_video_frames
+            if eval_num_video_frames is not None
+            else (int(cfg.data.train.num_frames) - 1)
+            // int(cfg.data.train.action_video_freq_ratio)
+            + 1
+        )
+    if num_video_frames <= 0:
+        raise ValueError(
+            f"`num_video_frames` must be positive, got {num_video_frames}"
+        )
+
     replan_steps = _parse_optional_int(usr_args.get("replan_steps"))
     if replan_steps is None:
         replan_steps = int(cfg.EVALUATION.get("replan_steps", 8))
@@ -417,6 +526,16 @@ def get_model(usr_args: Dict[str, Any]):
     timing_enabled = _parse_bool(
         usr_args.get("timing_enabled", cfg.EVALUATION.get("timing_enabled", False))
     )
+    timing_result_path: Optional[Path] = None
+    if timing_enabled:
+        configured_result_path = os.environ.get("WAM_TIMING_RESULT_PATH")
+        if not _is_none_like(configured_result_path):
+            timing_result_path = Path(str(configured_result_path)).expanduser().resolve()
+        elif not _is_none_like(usr_args.get("eval_output_dir")):
+            timing_result_path = (
+                Path(str(usr_args["eval_output_dir"])).expanduser().resolve()
+                / "replan_timing.json"
+            )
 
     policy = WorldActionRobotWinPolicy(
         model_cfg=cfg.model,
@@ -435,7 +554,11 @@ def get_model(usr_args: Dict[str, Any]):
         rand_device=rand_device,
         tiled=tiled,
         timing_enabled=timing_enabled,
-        num_video_frames=(int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1,
+        num_video_frames=num_video_frames,
+        timing_result_path=timing_result_path,
+        timing_task_name=(
+            None if _is_none_like(usr_args.get("task_name")) else str(usr_args["task_name"])
+        ),
     )
     return policy
 

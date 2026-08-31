@@ -24,6 +24,7 @@ EVALUATION:
 
   # Action inference
   action_horizon: null
+  num_video_frames: null
   replan_steps: 24
   num_inference_steps: ${eval_num_inference_steps}
   sigma_shift: null
