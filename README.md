@@ -355,6 +355,12 @@ Set it to `false` if you want to save a fully rendered video.
 
 ### 1) Precompute T5 embedding cache before training
 
+Existing caches can be either padded to `context_len` (128 by default) or
+padding-trimmed, such as `text_embeds_cache_trimmed`. The dataset loader restores
+trailing zero embeddings and a false padding mask in memory, retaining the
+existing model-input behavior. Keep `context_len=128` for `t5_len128` files;
+no cache rewriting, embedding recomputation, or extra flag is needed.
+
 Use `scripts/precompute_text_embeds.py` to precompute embeddings for each training task:
 
 ```bash
@@ -386,6 +392,54 @@ bash scripts/train_zero1.sh 8 task=robotwin_uncond_3cam_384_1e-4
 ```
 
 For LIBERO, we train on a single node with 8 GPUs. For RoboTwin, we use 64 GPUs to accelerate training. You can try reducing the GPU count or training epochs.
+
+### Selected-six-task RoboTwin baseline (aligned with RollingWAM)
+
+`configs/data/robotwin_selected_tasks.yaml` selects `lift_pot`,
+`beat_block_hammer`, `place_dual_shoes`, `stack_bowls_two`,
+`blocks_ranking_size`, and `stack_blocks_three`. The default is **50 clean
+demonstrations per task, 300 total**, with no training holdout. The validation
+loader still takes 1% (three episodes) from the same pool, matching RollingWAM;
+its losses/videos are diagnostics, not held-out evaluation.
+
+The training budget matches RollingWAM's single-node presets: four epochs,
+effective batch size 128, cosine learning rate `1e-4`, weight decay `1e-2`,
+BF16, ZeRO-2, and evaluation every 200 optimizer steps.
+
+| Preset | GPUs | Batch/GPU | Gradient accumulation | Save every (steps) |
+| --- | --- | --- | --- | --- |
+| `robotwin_selected_tasks_uncond_3cam_384_1e-4` | 8 | 8 | 2 | 666 |
+| `robotwin_selected_tasks_uncond_3cam_384_1e-4_4gpu` | 4 | 4 | 8 | 200 |
+
+FastWAM keeps its own model: 32-action training horizon, Wan2.2 video weights,
+and the interpolated 1024-dimensional ActionDiT from Model Preparation step 2.
+RollingWAM's rolling-window horizon and attention settings are not copied.
+FastWAM's existing optional W&B setting remains disabled by default.
+
+The default paths are `/datasets/robotwin2.0-fastwam/robotwin2.0` and
+`/datasets/robotwin2.0-fastwam/text_embeds_cache/<task_name>`. All six precomputed
+text-cache directories must be present; no embedding recomputation is needed.
+Leave `pretrained_norm_stats: null` for the new six-task mixture: training
+generates the run's `dataset_stats.json`, and validation reuses it automatically.
+Do not reuse statistics or resume state from an old three-task run for a fresh
+six-task comparison.
+
+After preparing the Wan components and interpolated ActionDiT checkpoint:
+
+```bash
+# Four GPUs, IDs 0,1,2,3 by default.
+bash scripts/robotwin/train_selected_tasks_fastwam_4gpu.sh
+
+# Or eight GPUs, IDs 0,1,2,3,4,5,6,7 by default.
+bash scripts/robotwin/train_selected_tasks_fastwam_8gpu.sh
+```
+
+These wrappers use the repository's `checkpoints` directory and disable model
+downloads by default. Explicit `CUDA_VISIBLE_DEVICES`,
+`DIFFSYNTH_MODEL_BASE_PATH`, and `DIFFSYNTH_SKIP_DOWNLOAD` values are respected.
+Choose four or eight visible GPUs to match the wrapper, and append Hydra
+overrides as usual (for example `data.dataset_root=/your/dataset/robotwin2.0`).
+Edit `data.selected_task_names` in the data YAML to change the task list.
 
 ## Inference with Your Trained Checkpoints
 

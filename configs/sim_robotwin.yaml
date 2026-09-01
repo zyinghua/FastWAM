@@ -24,6 +24,7 @@ EVALUATION:
 
   # Action inference
   action_horizon: null
+  num_video_frames: null
   replan_steps: 24
   num_inference_steps: ${eval_num_inference_steps}
   sigma_shift: null
@@ -31,6 +32,7 @@ EVALUATION:
   negative_prompt: ""
   rand_device: cpu
   tiled: false
+  # Per-episode model-call latency: first replan, then mean/min/max of later replans.
   timing_enabled: false
   skip_get_obs_within_replan: true
 

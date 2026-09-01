@@ -1,7 +1,9 @@
-import torch
-import numpy as np
+import re
 from pathlib import Path
 from typing import List, Literal, Dict, Optional, Any, DefaultDict
+
+import numpy as np
+import torch
 from tqdm import tqdm
 from .lerobot.lerobot_dataset import LeRobotDatasetMetadata, MultiLeRobotDataset
 
@@ -9,10 +11,403 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import traceback
 from fastwam.utils.logging_config import get_logger
 from .processors.base_processor import BaseProcessor
+from .text_cache import (
+    DEFAULT_PROMPT,
+    DEFAULT_TEXT_ENCODER_ID,
+    resolve_task_text_embedding_cache_dirs,
+    text_embedding_cache_filename,
+)
 
 logger = get_logger(__name__)
 
 MAX_GETITEM_ATTEMPT = 5
+SELECTED_TASK_DATA_MODES = ("clean", "clean_and_randomized")
+ROBOTWIN_FASTWAM_NUM_TASKS = 50
+ROBOTWIN_FASTWAM_CLEAN_EPISODES_PER_TASK = 50
+ROBOTWIN_FASTWAM_RANDOMIZED_EPISODES_PER_TASK = 500
+ROBOTWIN_FASTWAM_EPISODES_PER_TASK = (
+    ROBOTWIN_FASTWAM_CLEAN_EPISODES_PER_TASK
+    + ROBOTWIN_FASTWAM_RANDOMIZED_EPISODES_PER_TASK
+)
+ROBOTWIN_FASTWAM_TOTAL_EPISODES = (
+    ROBOTWIN_FASTWAM_NUM_TASKS * ROBOTWIN_FASTWAM_EPISODES_PER_TASK
+)
+
+
+def _normalize_task_name(task_name: str) -> str:
+    """Normalize task metadata so names such as ``lift pot`` and ``lift_pot`` match."""
+    return re.sub(r"[^a-z0-9]+", "_", task_name.strip().lower()).strip("_")
+
+
+def _validate_selected_task_data_mode(
+    selected_task_data_mode: str,
+) -> Literal["clean", "clean_and_randomized"]:
+    if selected_task_data_mode not in SELECTED_TASK_DATA_MODES:
+        raise ValueError(
+            "`selected_task_data_mode` must be one of "
+            f"{list(SELECTED_TASK_DATA_MODES)}, got {selected_task_data_mode!r}."
+        )
+    return selected_task_data_mode
+
+
+def _component_contains_normalized_token(component: str, token: str) -> bool:
+    """Match a normalized token sequence without accepting partial words."""
+    return (
+        component == token
+        or component.startswith(f"{token}_")
+        or component.endswith(f"_{token}")
+        or f"_{token}_" in component
+    )
+
+
+def _normalized_raw_file_components(raw_file_name: Any) -> List[str]:
+    if not isinstance(raw_file_name, str) or not raw_file_name.strip():
+        return []
+
+    return [
+        _normalize_task_name(component)
+        for component in re.split(r"[/\\]+", raw_file_name)
+        if component
+    ]
+
+
+def _raw_file_matches_task(raw_file_name: Any, normalized_task_name: str) -> bool:
+    """Match a canonical RoboTwin task anywhere in a raw source path component."""
+    return any(
+        _component_contains_normalized_token(component, normalized_task_name)
+        for component in _normalized_raw_file_components(raw_file_name)
+    )
+
+
+def _raw_file_matches_selected_task_data_mode(
+    raw_file_name: Any,
+    selected_task_data_mode: Literal["clean", "clean_and_randomized"],
+) -> bool:
+    """Use raw source metadata to enforce clean-only selection when requested."""
+    selected_task_data_mode = _validate_selected_task_data_mode(selected_task_data_mode)
+    if selected_task_data_mode == "clean_and_randomized":
+        # Preserve the previous behavior: this mode does not restrict source phase.
+        return True
+
+    path_components = _normalized_raw_file_components(raw_file_name)
+    has_clean_marker = any(
+        _component_contains_normalized_token(component, "demo_clean")
+        for component in path_components
+    )
+    has_randomized_marker = any(
+        _component_contains_normalized_token(component, "demo_randomized")
+        for component in path_components
+    )
+    return has_clean_marker and not has_randomized_marker
+
+
+def _select_task_episode_indices_for_data_mode(
+    meta: LeRobotDatasetMetadata,
+    episode_indices_by_task: Dict[str, List[int]],
+    selected_task_data_mode: Literal["clean", "clean_and_randomized"],
+) -> tuple[Dict[str, List[int]], str]:
+    """Apply the demo-phase filter after task identity has been resolved.
+
+    Newer/custom conversions may preserve the source path in ``raw_file_name``.
+    The released 27,500-episode FastWAM archive does not. That archive stores 50
+    task-aligned blocks of 550 episodes, ordered as 50 ``demo_clean`` followed by
+    500 ``demo_randomized`` episodes. The fallback below checks the complete
+    layout before relying on that ordering, so it cannot silently select the
+    first 50 episodes from an unknown or reordered dataset.
+    """
+    selected_task_data_mode = _validate_selected_task_data_mode(selected_task_data_mode)
+    if selected_task_data_mode == "clean_and_randomized":
+        return {
+            task_name: sorted(episode_indices)
+            for task_name, episode_indices in episode_indices_by_task.items()
+        }, "all matched task episodes"
+
+    candidate_indices = sorted(
+        episode_index
+        for episode_indices in episode_indices_by_task.values()
+        for episode_index in episode_indices
+    )
+    raw_file_presence = [
+        isinstance(meta.episodes[episode_index].get("raw_file_name"), str)
+        and bool(meta.episodes[episode_index]["raw_file_name"].strip())
+        for episode_index in candidate_indices
+    ]
+
+    if raw_file_presence and all(raw_file_presence):
+        selected = {
+            task_name: [
+                episode_index
+                for episode_index in sorted(episode_indices)
+                if _raw_file_matches_selected_task_data_mode(
+                    meta.episodes[episode_index].get("raw_file_name"), "clean"
+                )
+            ]
+            for task_name, episode_indices in episode_indices_by_task.items()
+        }
+        return selected, "raw_file_name demo phase"
+
+    if any(raw_file_presence):
+        raise ValueError(
+            "Only some matched episodes contain `raw_file_name`; refusing to mix "
+            "source-path phase labels with an ordering fallback."
+        )
+
+    if meta.total_episodes != ROBOTWIN_FASTWAM_TOTAL_EPISODES:
+        raise ValueError(
+            "Clean-only selection requires either `raw_file_name` phase metadata or "
+            "the verified released FastWAM RoboTwin layout. The dataset has no "
+            f"`raw_file_name` and contains {meta.total_episodes} episodes instead of "
+            f"{ROBOTWIN_FASTWAM_TOTAL_EPISODES}."
+        )
+
+    selected: Dict[str, List[int]] = {}
+    for task_name, episode_indices in episode_indices_by_task.items():
+        ordered = sorted(episode_indices)
+        if len(ordered) != ROBOTWIN_FASTWAM_EPISODES_PER_TASK:
+            raise ValueError(
+                "The released-layout clean fallback expected "
+                f"{ROBOTWIN_FASTWAM_EPISODES_PER_TASK} matched episodes for "
+                f"{task_name!r}, got {len(ordered)}."
+            )
+        block_start = ordered[0]
+        expected_block = list(
+            range(block_start, block_start + ROBOTWIN_FASTWAM_EPISODES_PER_TASK)
+        )
+        if (
+            block_start % ROBOTWIN_FASTWAM_EPISODES_PER_TASK != 0
+            or ordered != expected_block
+        ):
+            raise ValueError(
+                "The released-layout clean fallback requires each task to occupy one "
+                f"aligned contiguous block of {ROBOTWIN_FASTWAM_EPISODES_PER_TASK} "
+                f"episodes. Task {task_name!r} matched indices beginning at "
+                f"{ordered[:10]}; refusing to infer the demo phase."
+            )
+        selected[task_name] = ordered[:ROBOTWIN_FASTWAM_CLEAN_EPISODES_PER_TASK]
+
+    return selected, "released archive order (50 clean, then 500 randomized)"
+
+
+def _episode_instruction_tasks(
+    meta: LeRobotDatasetMetadata,
+    episode_index: int,
+    episode: Dict[str, Any],
+) -> set[str]:
+    """Resolve the low-level instruction(s), excluding coarse/quality annotations."""
+    episode_stats = getattr(meta, "episodes_stats", {}).get(episode_index, {})
+    task_index_stats = episode_stats.get("task_index")
+    if task_index_stats is not None:
+        task_indices = set()
+        for statistic in ("min", "max"):
+            if statistic not in task_index_stats:
+                continue
+            values = np.asarray(task_index_stats[statistic]).reshape(-1)
+            task_indices.update(int(value) for value in values)
+        resolved_tasks = {
+            meta.tasks[task_index]
+            for task_index in task_indices
+            if task_index in meta.tasks
+        }
+        if resolved_tasks:
+            return resolved_tasks
+
+    # Compatibility fallback for datasets whose episode stats omit task_index.
+    return {task for task in episode.get("tasks", []) if isinstance(task, str)}
+
+
+def _select_episode_indices(
+    meta: LeRobotDatasetMetadata,
+    task_names: Optional[List[str]],
+    selected_task_data_mode: Literal["clean", "clean_and_randomized"] = "clean_and_randomized",
+    task_text_embedding_cache_root: Optional[str] = None,
+    text_embedding_context_len: int = 128,
+    expected_episodes_per_task: Optional[int] = None,
+) -> List[int]:
+    """Return episode indices matching selected RoboTwin tasks and demo mode."""
+    if task_names is None:
+        return list(range(meta.total_episodes))
+    if len(task_names) == 0:
+        raise ValueError("`task_names` must be null (all tasks) or a non-empty list.")
+    selected_task_data_mode = _validate_selected_task_data_mode(selected_task_data_mode)
+
+    requested_by_normalized = {}
+    for task_name in task_names:
+        if not isinstance(task_name, str) or not task_name.strip():
+            raise ValueError(f"Every entry in `task_names` must be a non-empty string, got {task_name!r}.")
+        normalized = _normalize_task_name(task_name)
+        if normalized in requested_by_normalized:
+            raise ValueError(
+                "Duplicate task after normalization: "
+                f"{requested_by_normalized[normalized]!r} and {task_name!r}."
+            )
+        requested_by_normalized[normalized] = task_name
+
+    metadata_tasks_by_normalized = {}
+    for metadata_task in meta.task_to_task_index:
+        metadata_tasks_by_normalized.setdefault(_normalize_task_name(metadata_task), []).append(metadata_task)
+
+    cache_filenames_by_normalized_task = None
+    if task_text_embedding_cache_root is not None:
+        configured_cache_dirs = {}
+        resolved_cache_dirs = resolve_task_text_embedding_cache_dirs(
+            task_names,
+            task_text_embedding_cache_root,
+        )
+        for task_name, cache_dir in resolved_cache_dirs.items():
+            normalized = _normalize_task_name(str(task_name))
+            if normalized in configured_cache_dirs:
+                raise ValueError(f"Duplicate selected task after normalization: {task_name!r}.")
+            configured_cache_dirs[normalized] = cache_dir
+
+        cache_filenames_by_normalized_task = {}
+        filename_pattern = (
+            f"*.t5_len{text_embedding_context_len}.{DEFAULT_TEXT_ENCODER_ID}.pt"
+        )
+        for normalized, cache_dir in configured_cache_dirs.items():
+            if not cache_dir.is_dir():
+                raise FileNotFoundError(
+                    f"Text embedding cache directory for {requested_by_normalized[normalized]!r} "
+                    f"does not exist: {cache_dir}"
+                )
+            cache_filenames = {path.name for path in cache_dir.rglob(filename_pattern)}
+            if not cache_filenames:
+                raise FileNotFoundError(
+                    f"No {filename_pattern} files found for {requested_by_normalized[normalized]!r} "
+                    f"under {cache_dir}."
+                )
+            cache_filenames_by_normalized_task[normalized] = cache_filenames
+            logger.info(
+                "Indexed %d precomputed text embeddings for task %s from %s.",
+                len(cache_filenames),
+                requested_by_normalized[normalized],
+                cache_dir,
+            )
+
+    matched_metadata_tasks = {
+        normalized: set(metadata_tasks_by_normalized.get(normalized, []))
+        for normalized in requested_by_normalized
+    }
+    episode_indices_by_task = {
+        original: [] for original in requested_by_normalized.values()
+    }
+    for episode_index, episode in meta.episodes.items():
+        episode_tasks = set(episode.get("tasks", []))
+        episode_instruction_tasks = _episode_instruction_tasks(meta, episode_index, episode)
+        episode_cache_filenames = {
+            text_embedding_cache_filename(
+                DEFAULT_PROMPT.format(task=episode_task),
+                context_len=text_embedding_context_len,
+            )
+            for episode_task in episode_instruction_tasks
+        }
+        matched_requested_tasks = []
+        for normalized, original in requested_by_normalized.items():
+            matches_task_metadata = bool(matched_metadata_tasks[normalized].intersection(episode_tasks))
+            matches_raw_file = _raw_file_matches_task(episode.get("raw_file_name"), normalized)
+            if cache_filenames_by_normalized_task is not None:
+                matches_selected_cache = bool(
+                    cache_filenames_by_normalized_task[normalized].intersection(episode_cache_filenames)
+                )
+                raw_file_identifies_selected_task = any(
+                    _raw_file_matches_task(episode.get("raw_file_name"), candidate)
+                    for candidate in requested_by_normalized
+                )
+                # Prompt embeddings identify the task. A source path, when present,
+                # additionally disambiguates explicit task directories.
+                matches_episode = (
+                    matches_selected_cache
+                    and (matches_raw_file or not raw_file_identifies_selected_task)
+                )
+            else:
+                matches_episode = matches_task_metadata or matches_raw_file
+            if matches_episode:
+                matched_requested_tasks.append(original)
+
+        if len(matched_requested_tasks) > 1:
+            raise ValueError(
+                f"Episode {episode_index} matched multiple selected task names "
+                f"{matched_requested_tasks}; refusing an ambiguous selection."
+            )
+        if matched_requested_tasks:
+            episode_indices_by_task[matched_requested_tasks[0]].append(episode_index)
+
+    tasks_without_episodes = [
+        task_name
+        for task_name, episode_indices in episode_indices_by_task.items()
+        if not episode_indices
+    ]
+    if tasks_without_episodes:
+        raw_file_examples = [
+            episode.get("raw_file_name")
+            for episode in meta.episodes.values()
+            if episode.get("raw_file_name") is not None
+        ][:10]
+        available = sorted(metadata_tasks_by_normalized)
+        raise ValueError(
+            f"No episodes matched requested task(s) {tasks_without_episodes} in {meta.root}. "
+            f"Selected task data mode: {selected_task_data_mode!r}. "
+            "Selected-task matching uses low-level `task_index` instructions and their precomputed cache "
+            "files, with canonical `raw_file_name` components as an additional disambiguator. "
+            "It does not guess from instruction keywords. "
+            f"Available normalized metadata tasks include: {available[:50]}. "
+            f"Example raw_file_name values: {raw_file_examples}"
+        )
+
+    episode_indices_by_task, data_mode_source = _select_task_episode_indices_for_data_mode(
+        meta,
+        episode_indices_by_task,
+        selected_task_data_mode,
+    )
+    episode_counts = {
+        task_name: len(episode_indices)
+        for task_name, episode_indices in episode_indices_by_task.items()
+    }
+    episode_indices = sorted(
+        episode_index
+        for task_episode_indices in episode_indices_by_task.values()
+        for episode_index in task_episode_indices
+    )
+
+    tasks_without_episodes = [
+        task_name for task_name, count in episode_counts.items() if count == 0
+    ]
+    if tasks_without_episodes:
+        raise ValueError(
+            f"No episodes remained for requested task(s) {tasks_without_episodes} after "
+            f"applying selected_task_data_mode={selected_task_data_mode!r} via "
+            f"{data_mode_source}."
+        )
+
+    if expected_episodes_per_task is not None:
+        if expected_episodes_per_task <= 0:
+            raise ValueError(
+                f"`expected_episodes_per_task` must be positive or null, got {expected_episodes_per_task}."
+            )
+        unexpected_counts = {
+            task_name: count
+            for task_name, count in episode_counts.items()
+            if count != expected_episodes_per_task
+        }
+        if unexpected_counts:
+            raise ValueError(
+                f"Selected-task episode counts do not equal expected_episodes_per_task="
+                f"{expected_episodes_per_task} for selected_task_data_mode="
+                f"{selected_task_data_mode!r}: {unexpected_counts}."
+            )
+
+    logger.info(
+        "Selected %d/%d episodes from %s for task_names=%s, "
+        "selected_task_data_mode=%s via %s (per-task counts=%s)",
+        len(episode_indices),
+        meta.total_episodes,
+        meta.root,
+        list(task_names),
+        selected_task_data_mode,
+        data_mode_source,
+        episode_counts,
+    )
+    return episode_indices
+
 
 class BaseLerobotDataset(torch.utils.data.Dataset):
     metadata_cls = LeRobotDatasetMetadata
@@ -34,6 +429,11 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         val_set_proportion: float = 0.05, 
         is_training_set: bool = False,
         seed: int = 42,
+        task_names: Optional[List[str]] = None,
+        selected_task_data_mode: Literal["clean", "clean_and_randomized"] = "clean_and_randomized",
+        task_text_embedding_cache_root: Optional[str] = None,
+        text_embedding_context_len: int = 128,
+        expected_episodes_per_task: Optional[int] = None,
 
         # sampling
         global_sample_stride: int = 1,
@@ -95,21 +495,40 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             meta["lerobot_key"] = f"action.{key}" if key != "default" else "action"
             delta_timestamps[meta["lerobot_key"]] = [(t * global_sample_stride) / fps for t in range(-past_action_size, -past_action_size + action_size)]
 
+        if not 0 <= val_set_proportion < 1:
+            raise ValueError(f"`val_set_proportion` must be in [0, 1), got {val_set_proportion}.")
+
         episodes = {}
-        if val_set_proportion < 1e-6:
-            for meta in metas:
-                episodes.update({meta.repo_id: list(range(meta.total_episodes))})
-        else:
-            for meta in metas:
-                split_idx = int(meta.total_episodes * (1 - val_set_proportion))
-                # random shuffle episode indices before splitting
-                episode_indices = list(range(meta.total_episodes))
+        for meta in metas:
+            episode_indices = _select_episode_indices(
+                meta,
+                task_names,
+                selected_task_data_mode=selected_task_data_mode,
+                task_text_embedding_cache_root=task_text_embedding_cache_root,
+                text_embedding_context_len=text_embedding_context_len,
+                expected_episodes_per_task=expected_episodes_per_task,
+            )
+            if val_set_proportion >= 1e-6:
+                split_idx = int(len(episode_indices) * (1 - val_set_proportion))
+                # Shuffle after filtering so the train/val ratio applies to the selected tasks only.
                 rng = np.random.default_rng(seed)
                 rng.shuffle(episode_indices)
                 if self.is_training_set:
-                    episodes.update({meta.repo_id: [episode_indices[i] for i in range(split_idx)]})
+                    episode_indices = episode_indices[:split_idx]
                 else:
-                    episodes.update({meta.repo_id: [episode_indices[i] for i in range(split_idx, meta.total_episodes)]})
+                    episode_indices = episode_indices[split_idx:]
+            if not episode_indices:
+                split_name = "training" if self.is_training_set else "validation"
+                raise ValueError(
+                    f"The {split_name} split for dataset {meta.root} contains no episodes after filtering."
+                )
+            episodes[meta.repo_id] = episode_indices
+            logger.info(
+                "Using %d episodes from %s for the %s split.",
+                len(episode_indices),
+                meta.root,
+                "training" if self.is_training_set else "validation",
+            )
 
         tolerances_s = None if tolerance_s is None else dict.fromkeys(self.dataset_dirs, tolerance_s)
         self.multi_dataset = self.multi_dataset_cls(
