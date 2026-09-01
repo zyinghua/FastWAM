@@ -7,6 +7,14 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+if sys.platform == "linux" and not (
+    "__EGL_VENDOR_LIBRARY_FILENAMES" in os.environ
+    or "__EGL_VENDOR_LIBRARY_DIRS" in os.environ
+):
+    os.environ["__EGL_VENDOR_LIBRARY_FILENAMES"] = str(
+        Path(__file__).resolve().with_name("nvidia_egl.json")
+    )
+
 import hydra
 import numpy as np
 import torch
