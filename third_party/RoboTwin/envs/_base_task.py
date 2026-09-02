@@ -408,7 +408,7 @@ class Base_Task(gym.Env):
         """
         load aloha robot urdf file, set root pose and set joints
         """
-        if not hasattr(self, "robot"):
+        if not hasattr(self, "robot") or self.robot is None:
             self.robot = Robot(self.scene, self.need_topp, **kwags)
             self.robot.set_planner(self.scene)
             self.robot.init_joints()
@@ -598,6 +598,30 @@ class Base_Task(gym.Env):
         self.eval_video_ffmpeg = ffmpeg
 
     def close_env(self, clear_cache=False):
+        if hasattr(self, "eval_video_ffmpeg"):
+            try:
+                self._del_eval_video_ffmpeg()
+            except Exception:
+                pass
+
+        if hasattr(self, "viewer"):
+            try:
+                self.viewer.close()
+            except Exception:
+                pass
+            self.viewer = None
+
+        if hasattr(self, "cameras"):
+            self.cameras = None
+        if hasattr(self, "robot"):
+            self.robot = None
+        if hasattr(self, "scene"):
+            self.scene = None
+        if hasattr(self, "renderer"):
+            self.renderer = None
+        if hasattr(self, "engine"):
+            self.engine = None
+
         if clear_cache:
             # for actor in self.scene.get_all_actors():
             #     self.scene.remove_actor(actor)
@@ -605,10 +629,32 @@ class Base_Task(gym.Env):
         self.close()
 
     def _del_eval_video_ffmpeg(self):
-        if self.eval_video_ffmpeg:
-            self.eval_video_ffmpeg.stdin.close()
-            self.eval_video_ffmpeg.wait()
-            del self.eval_video_ffmpeg
+        process = getattr(self, "eval_video_ffmpeg", None)
+        if process is None:
+            return
+        try:
+            if process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except (BrokenPipeError, OSError, ValueError):
+                    pass
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+        finally:
+            self.eval_video_ffmpeg = None
 
     def delay(self, delay_time, save_freq=None):
         render_freq = self.render_freq

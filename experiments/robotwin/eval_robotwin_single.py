@@ -242,23 +242,33 @@ def main(cfg: DictConfig):
     env["CUDA_VISIBLE_DEVICES"] = str(cfg.gpu_id)
     env["PYTHONUNBUFFERED"] = "1"
 
+    process: subprocess.Popen[str] | None = None
     with open(log_file, "w", encoding="utf-8") as log_f:
-        process = subprocess.Popen(
-            cmd,
-            cwd=str(robotwin_root),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        assert process.stdout is not None
-        for line in process.stdout:
-            sys.stdout.write(line)
-            sys.stdout.flush()
-            log_f.write(line)
-            log_f.flush()
-        return_code = process.wait()
+        try:
+            process = subprocess.Popen(
+                cmd,
+                cwd=str(robotwin_root),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            assert process.stdout is not None
+            for line in process.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                log_f.write(line)
+                log_f.flush()
+            return_code = process.wait()
+        finally:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
 
     if return_code != 0:
         raise RuntimeError(f"RoboTwin evaluation failed with return code {return_code}. Log: {log_file}")

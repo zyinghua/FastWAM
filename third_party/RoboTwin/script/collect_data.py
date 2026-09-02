@@ -140,7 +140,7 @@ def run(TASK_ENV, args):
 
                 TASK_ENV.close_env()
 
-                if args["render_freq"]:
+                if args["render_freq"] and TASK_ENV.viewer is not None:
                     TASK_ENV.viewer.close()
             except UnStableError as e:
                 print(" -------------")
@@ -150,7 +150,7 @@ def run(TASK_ENV, args):
                 fail_num += 1
                 TASK_ENV.close_env()
 
-                if args["render_freq"]:
+                if args["render_freq"] and TASK_ENV.viewer is not None:
                     TASK_ENV.viewer.close()
                 time.sleep(0.3)
             except Exception as e:
@@ -162,7 +162,7 @@ def run(TASK_ENV, args):
                 fail_num += 1
                 TASK_ENV.close_env()
 
-                if args["render_freq"]:
+                if args["render_freq"] and TASK_ENV.viewer is not None:
                     TASK_ENV.viewer.close()
                 time.sleep(1)
 
@@ -224,10 +224,11 @@ def run(TASK_ENV, args):
             with open(info_file_path, "w", encoding="utf-8") as file:
                 json.dump(info_db, file, ensure_ascii=False, indent=4)
 
+            collect_success = TASK_ENV.check_success()
             TASK_ENV.close_env(clear_cache=((episode_idx + 1) % clear_cache_freq == 0))
             TASK_ENV.merge_pkl_to_hdf5_video()
             TASK_ENV.remove_data_cache()
-            assert TASK_ENV.check_success(), "Collect Error"
+            assert collect_success, "Collect Error"
 
         command = f"cd description && bash gen_episode_instructions.sh {args['task_name']} {args['task_config']} {args['language_num']}"
         os.system(command)

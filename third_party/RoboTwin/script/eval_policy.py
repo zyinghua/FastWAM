@@ -266,17 +266,19 @@ def eval_policy(task_name,
     while succ_seed < test_num:
         render_freq = args["render_freq"]
         args["render_freq"] = 0
+        expert_success = True
 
         if expert_check:
             try:
                 TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
                 episode_info = TASK_ENV.play_once()
-                TASK_ENV.close_env()
+                expert_success = TASK_ENV.plan_success and TASK_ENV.check_success()
+                TASK_ENV.close_env(clear_cache=True)
             except UnStableError as e:
                 # print(" -------------")
                 # print("Error: ", e)
                 # print(" -------------")
-                TASK_ENV.close_env()
+                TASK_ENV.close_env(clear_cache=True)
                 now_seed += 1
                 args["render_freq"] = render_freq
                 continue
@@ -285,13 +287,13 @@ def eval_policy(task_name,
                 print("Error: ", e)
                 print("Stack Trace: ", traceback.format_exc())
                 print(" -------------")
-                TASK_ENV.close_env()
+                TASK_ENV.close_env(clear_cache=True)
                 now_seed += 1
                 args["render_freq"] = render_freq
                 print("error occurs !")
                 continue
 
-        if (not expert_check) or (TASK_ENV.plan_success and TASK_ENV.check_success()):
+        if (not expert_check) or expert_success:
             succ_seed += 1
             suc_test_seed_list.append(now_seed)
         else:
@@ -309,7 +311,7 @@ def eval_policy(task_name,
             succ_seed -= 1
             if len(suc_test_seed_list) > 0 and suc_test_seed_list[-1] == now_seed:
                 suc_test_seed_list.pop()
-            TASK_ENV.close_env()
+            TASK_ENV.close_env(clear_cache=True)
             now_seed += 1
             continue
         except Exception as e:
@@ -320,7 +322,7 @@ def eval_policy(task_name,
             print("Error: ", e)
             print("Stack Trace: ", traceback.format_exc())
             print(" -------------")
-            TASK_ENV.close_env()
+            TASK_ENV.close_env(clear_cache=True)
             now_seed += 1
             print("error occurs !")
             continue
@@ -396,7 +398,7 @@ def eval_policy(task_name,
         now_id += 1
         TASK_ENV.close_env(clear_cache=((succ_seed + 1) % clear_cache_freq == 0))
 
-        if TASK_ENV.render_freq:
+        if TASK_ENV.render_freq and TASK_ENV.viewer is not None:
             TASK_ENV.viewer.close()
 
         TASK_ENV.test_num += 1
