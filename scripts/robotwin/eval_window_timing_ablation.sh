@@ -24,11 +24,18 @@ TASK_NAME="${3:-beat_block_hammer}"
 EPISODES="${4:-10}"
 DRY_RUN="${DRY_RUN:-0}"
 SEED="${SEED:-0}"
+FIXED_ACTION_HORIZON="${FIXED_ACTION_HORIZON:-}"
 
 [[ "$GPU_ID" =~ ^[0-9]+$ ]] || fail "gpu_id must be a non-negative integer, got: $GPU_ID"
 [[ "$EPISODES" =~ ^[1-9][0-9]*$ ]] || fail "episodes must be a positive integer, got: $EPISODES"
 [[ "$DRY_RUN" == "0" || "$DRY_RUN" == "1" ]] || fail "DRY_RUN must be 0 or 1, got: $DRY_RUN"
 [[ "$SEED" =~ ^[0-9]+$ ]] || fail "SEED must be a non-negative integer, got: $SEED"
+if [[ -n "$FIXED_ACTION_HORIZON" ]]; then
+  [[ "$FIXED_ACTION_HORIZON" =~ ^[1-9][0-9]*$ ]] || \
+    fail "FIXED_ACTION_HORIZON must be a positive integer, got: $FIXED_ACTION_HORIZON"
+  (( FIXED_ACTION_HORIZON % 4 == 0 )) || \
+    fail "FIXED_ACTION_HORIZON must be divisible by 4, got: $FIXED_ACTION_HORIZON"
+fi
 [[ -n "$TASK_NAME" ]] || fail "task_name must not be empty"
 [[ -f "$FASTWAM_CKPT" ]] || fail "FastWAM checkpoint not found: $FASTWAM_CKPT"
 
@@ -86,15 +93,24 @@ RESULT_DIR="$(cd "$RESULT_DIR" && pwd -P)"
 cd "$REPO_ROOT"
 
 echo "FastWAM timing sweep: task=$TASK_NAME episodes=$EPISODES seed=$SEED gpu=$GPU_ID"
-echo "Schedule: K=floor(16/W); matched total S=W*K; horizon=16*W; joint_video_frames=4*W+1"
+if [[ -n "$FIXED_ACTION_HORIZON" ]]; then
+  echo "Schedule: K=floor(16/W); matched total S=W*K; fixed horizon=$FIXED_ACTION_HORIZON"
+else
+  echo "Schedule: K=floor(16/W); matched total S=W*K; horizon=16*W; joint_video_frames=4*W+1"
+fi
 echo "Checkpoint shared by both paths: $FASTWAM_CKPT"
 echo "Results: $RESULT_DIR"
 
 for window in {1..8}; do
   steady_steps=$((16 / window))
   total_steps=$((window * steady_steps))
-  action_horizon=$((16 * window))
-  num_video_frames=$((4 * window + 1))
+  if [[ -n "$FIXED_ACTION_HORIZON" ]]; then
+    action_horizon=$FIXED_ACTION_HORIZON
+    num_video_frames=$((action_horizon / 4 + 1))
+  else
+    action_horizon=$((16 * window))
+    num_video_frames=$((4 * window + 1))
+  fi
   run_name="w${window}_h${action_horizon}_s${total_steps}"
 
   fastwam_json="$RESULT_DIR/fastwam/$run_name.json"
@@ -194,7 +210,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
   exit 0
 fi
 
-"$PYTHON_BIN" - "$RESULT_DIR" "$TASK_NAME" "$EPISODES" "$SEED" <<'PY'
+"$PYTHON_BIN" - "$RESULT_DIR" "$TASK_NAME" "$EPISODES" "$SEED" "$FIXED_ACTION_HORIZON" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -203,6 +219,7 @@ result_dir = Path(sys.argv[1])
 task_name = sys.argv[2]
 episodes = int(sys.argv[3])
 seed = int(sys.argv[4])
+fixed_action_horizon = int(sys.argv[5]) if sys.argv[5] else None
 total_step_schedule = [window * (16 // window) for window in range(1, 9)]
 
 
@@ -230,8 +247,8 @@ def ratio(numerator, denominator):
 runs = []
 shared_checkpoint = None
 for window, total_steps in enumerate(total_step_schedule, start=1):
-    action_horizon = 16 * window
-    num_video_frames = 4 * window + 1
+    action_horizon = fixed_action_horizon or 16 * window
+    num_video_frames = action_horizon // 4 + 1
     rolling_steady_steps = 16 // window
     run_name = f"w{window}_h{action_horizon}_s{total_steps}"
     fastwam_path = result_dir / "fastwam" / f"{run_name}.json"
@@ -303,6 +320,11 @@ summary = {
     "seed": seed,
     "checkpoint": shared_checkpoint,
     "executed_actions_per_replan": 16,
+    "prediction_horizon_rule": (
+        f"fixed at {fixed_action_horizon} actions"
+        if fixed_action_horizon is not None
+        else "16*W actions"
+    ),
     "schedule_rule": "K=floor(16/W); matched total S=W*K; both FastWAM variants use S denoising passes per replan",
     "fastwam_joint_weights": "FastWAM-trained checkpoint; timing proxy only",
     "runs": runs,
