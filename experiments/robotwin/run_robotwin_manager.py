@@ -14,7 +14,7 @@ from typing import Any
 import hydra
 import yaml
 from hydra.core.hydra_config import HydraConfig
-from omegaconf import DictConfig
+from omegaconf import DictConfig, ListConfig
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SINGLE_ENTRY = PROJECT_ROOT / "experiments" / "robotwin" / "eval_robotwin_single.py"
@@ -160,6 +160,29 @@ def _load_all_tasks() -> list[str]:
     return dedup_tasks
 
 
+def _resolve_tasks(task_name_cfg: Any) -> list[str]:
+    if task_name_cfg is None:
+        return _load_all_tasks()
+    if isinstance(task_name_cfg, (list, tuple, ListConfig)):
+        if len(task_name_cfg) == 0:
+            raise ValueError("`EVALUATION.task_name` list must not be empty.")
+        tasks: list[str] = []
+        for index, task in enumerate(task_name_cfg):
+            if not isinstance(task, str) or not task.strip():
+                raise ValueError(
+                    f"`EVALUATION.task_name[{index}]` must be a non-empty string."
+                )
+            tasks.append(task.strip())
+        if len(tasks) != len(set(tasks)):
+            raise ValueError("`EVALUATION.task_name` list contains duplicate task names.")
+        return tasks
+
+    if not isinstance(task_name_cfg, str):
+        raise ValueError("`EVALUATION.task_name` must be null, a string, or a list.")
+    task_name = task_name_cfg.strip()
+    return _load_all_tasks() if not task_name else [task_name]
+
+
 def _parse_success_rate(result_file: Path) -> float:
     if not result_file.exists():
         raise FileNotFoundError(f"Result file not found: {result_file}")
@@ -253,11 +276,7 @@ def main(cfg: DictConfig):
     summary_csv = run_output_dir / "summary.csv"
     summary_json = run_output_dir / "summary.json"
 
-    task_name_cfg = cfg.EVALUATION.task_name
-    if task_name_cfg is None or str(task_name_cfg).strip() == "":
-        tasks = _load_all_tasks()
-    else:
-        tasks = [str(task_name_cfg)]
+    tasks = _resolve_tasks(cfg.EVALUATION.task_name)
 
     extra_overrides = _collect_worker_overrides()
 

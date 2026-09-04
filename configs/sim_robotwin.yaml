@@ -44,8 +44,8 @@ MULTIRUN:
   enabled: false
   num_gpus: 8
   max_tasks_per_gpu: 1
-  launch_stagger_seconds: 30
-  min_available_memory_gib: 32  # set to 0 to disable the host/container guard
+  launch_stagger_seconds: 0
+  min_available_memory_gib: 0  # disabled; set a positive reserve to enable the guard
 
 hydra:
   job:
