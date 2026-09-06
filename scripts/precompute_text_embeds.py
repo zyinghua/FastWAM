@@ -117,24 +117,37 @@ def _read_unique_prompts(dataset_dirs: list[str]) -> list[str]:
     total_task_rows = 0
 
     for ds_dir in dataset_dirs:
-        tasks_path = Path(ds_dir) / "meta" / "tasks.jsonl"
-        if not tasks_path.exists():
-            raise FileNotFoundError(f"Missing tasks file: {tasks_path}")
+        metadata_dir = Path(ds_dir).expanduser() / "meta"
+        parquet_path = metadata_dir / "tasks.parquet"
+        jsonl_path = metadata_dir / "tasks.jsonl"
+        if parquet_path.exists():
+            # Share task resolution with training: v3 stores text either in a
+            # `task` column or the DataFrame index, keyed by task_index.
+            from fastwam.datasets.lerobot3.lerobot_dataset import _load_tasks
 
-        with tasks_path.open("r", encoding="utf-8") as f:
-            for line_idx, line in enumerate(f, start=1):
-                line = line.strip()
-                if not line:
-                    continue
-                record = json.loads(line)
-                if "task" not in record:
-                    raise KeyError(f"Missing `task` field at {tasks_path}:{line_idx}")
-                task = str(record["task"])
-                prompt = DEFAULT_PROMPT.format(task=task)
-                total_task_rows += 1
-                if prompt not in seen:
-                    seen.add(prompt)
-                    prompts.append(prompt)
+            tasks = _load_tasks(parquet_path)
+            task_texts = tasks.values()
+        elif jsonl_path.exists():
+            task_texts = []
+            with jsonl_path.open("r", encoding="utf-8") as f:
+                for line_idx, line in enumerate(f, start=1):
+                    if not line.strip():
+                        continue
+                    record = json.loads(line)
+                    if "task" not in record:
+                        raise KeyError(f"Missing `task` field at {jsonl_path}:{line_idx}")
+                    task_texts.append(str(record["task"]))
+        else:
+            raise FileNotFoundError(
+                f"Missing LeRobot task metadata: expected {jsonl_path} or {parquet_path}."
+            )
+
+        for task in task_texts:
+            prompt = DEFAULT_PROMPT.format(task=task)
+            total_task_rows += 1
+            if prompt not in seen:
+                seen.add(prompt)
+                prompts.append(prompt)
 
     logger.info(
         "Loaded %d task rows from %d datasets, deduplicated to %d prompts.",
@@ -201,7 +214,7 @@ def main(cfg: DictConfig):
             raise ValueError("No `dataset_dirs` found under `cfg.data`.")
         prompts = _read_unique_prompts(dataset_dirs)
     if not prompts:
-        logger.warning("No prompts found from tasks.jsonl; nothing to do.")
+        logger.warning("No prompts found in LeRobot task metadata; nothing to do.")
         return
 
     if torch.cuda.is_available():

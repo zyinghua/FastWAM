@@ -11,7 +11,8 @@ Official codebase for **Fast-WAM: Do World Action Models Need Test-time Future I
 [![Hugging Face Dataset - LIBERO](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset%20LIBERO-f7c843)](https://huggingface.co/datasets/yuanty/LIBERO-fastwam)
 [![Hugging Face Dataset - RoboTwin](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset%20RoboTwin-f7c843)](https://huggingface.co/datasets/yuanty/robotwin2.0-fastwam)
 
-This repository contains the training and evaluation code for FastWAM on LIBERO / RoboTwin.
+This repository contains the training and evaluation code for FastWAM on LIBERO / RoboTwin,
+plus a [G1 LeRobot v3 training and deployment recipe](experiments/g1/README.md) aligned with RollingWAM's data schema.
 
 ## What's New
 
@@ -440,6 +441,49 @@ downloads by default. Explicit `CUDA_VISIBLE_DEVICES`,
 Choose four or eight visible GPUs to match the wrapper, and append Hydra
 overrides as usual (for example `data.dataset_root=/your/dataset/robotwin2.0`).
 Edit `data.selected_task_names` in the data YAML to change the task list.
+
+### G1 pick/place and pour (LeRobot v3)
+
+The `g1_pnp_pour_uncond_1cam_320_1e-4` task reads G1's aggregated Parquet/MP4
+dataset directly: one egocentric camera, 43 state values, and 78 action values.
+It trains on 33 observations and 32 actions, with images cropped to 224×320,
+using FastWAM's original first-frame action conditioning and action shift 1.
+
+After preparing the local Wan components and ActionDiT backbone:
+
+```bash
+export G1_DATA_ROOT=/Omni-G1/data/self_collected/g1_pnp_pour_v3
+export DIFFSYNTH_MODEL_BASE_PATH="$(pwd)/checkpoints"
+export DIFFSYNTH_SKIP_DOWNLOAD=true
+
+# Cache the instructions from meta/tasks.parquet.
+bash scripts/g1/precompute_g1_text_embeds.sh 1
+
+# Full training on eight GPUs with ZeRO-2.
+bash scripts/g1/train_g1.sh 8
+
+# JointWAM with the same G1 data and training settings.
+bash scripts/g1/train_g1.sh 8 task=g1_pnp_pour_joint_1cam_320_1e-4
+```
+
+Serve the trained weights and run the client template:
+
+```bash
+pip install -e '.[serving]'
+bash scripts/g1/serve_g1_policy.sh /path/to/run/checkpoints/weights/step_000666.pt
+# In a separate terminal:
+bash scripts/g1/client_template.sh ws://127.0.0.1:8000 "pick up the container and pour its contents"
+```
+
+The server selects FastWAM or JointWAM from the saved run config. The
+WebSocket/MessagePack interface matches RollingWAM's G1 workflow. Each method
+returns a fresh 32-action prediction for this task; a robot client can execute
+a prefix before replanning. The template uses synthetic observations and prints
+predictions without actuation.
+
+See [the G1 guide](experiments/g1/README.md) for local checkpoint paths,
+dataset/cache overrides, normalization, resume, and robot-client integration.
+Each wrapper also supports `--help`.
 
 ## Inference with Your Trained Checkpoints
 

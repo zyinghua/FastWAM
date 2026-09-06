@@ -1,0 +1,6 @@
+# @package _global_
+
+defaults:
+  - g1_pnp_pour_uncond_1cam_320_1e-4
+  - override /model: fastwam_joint
+  - _self_

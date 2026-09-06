@@ -40,6 +40,12 @@ dependencies = [
   "wandb==0.23.1",
 ]
 
+[project.optional-dependencies]
+serving = [
+  "msgpack==1.1.2",
+  "websockets==16.0",
+]
+
 [tool.setuptools.package-dir]
 "" = "src"
 

@@ -47,6 +47,23 @@ def _load_parquet_dataset(path: Path) -> datasets.Dataset:
     return datasets.Dataset.from_parquet([str(item) for item in paths])
 
 
+def _load_tasks(path: Path) -> dict[int, str]:
+    """Read both the v3 text index and conversions with an explicit task column."""
+    frame = pd.read_parquet(path)
+    if "task_index" not in frame.columns:
+        raise ValueError(f"LeRobot v3 task metadata has no `task_index` column: {path}.")
+    task_texts = frame["task"] if "task" in frame.columns else frame.index
+    tasks = {}
+    for raw_index, task in zip(frame["task_index"], task_texts, strict=True):
+        if not isinstance(task, str) or not task.strip():
+            raise ValueError(f"Expected non-empty task text for task index {raw_index} in {path}.")
+        task_index = int(raw_index)
+        if task_index in tasks:
+            raise ValueError(f"Duplicate LeRobot task index {task_index} in {path}.")
+        tasks[task_index] = task
+    return tasks
+
+
 def _episode_data_index(episode_rows: datasets.Dataset, episodes: list[int]):
     lengths = [int(episode_rows[episode_idx]["length"]) for episode_idx in episodes]
     cumulative = list(accumulate(lengths))
@@ -71,7 +88,7 @@ class LeRobotDatasetMetadata:
         if version != CODEBASE_VERSION:
             raise ValueError(f"Expected LeRobot codebase_version v3.0, got {version} at {self.root}.")
 
-        self.tasks = pd.read_parquet(self.root / "meta" / "tasks.parquet")
+        self.tasks = _load_tasks(self.root / "meta" / "tasks.parquet")
         episodes = _load_parquet_dataset(self.root / "meta" / "episodes")
         columns = [name for name in episodes.column_names if not name.startswith("stats/")]
         self.episodes = episodes.select_columns(columns)
@@ -297,7 +314,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         else:
             item["chunked_task_index"] = task_index
             task_index = int(task_index[0])
-        item["task"] = self.meta.tasks.iloc[task_index].name
+        item["task"] = self.meta.tasks[task_index]
         item["step_is_qualified"] = True
         return item
 
