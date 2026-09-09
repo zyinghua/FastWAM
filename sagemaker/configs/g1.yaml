@@ -1,0 +1,30 @@
+# SageMaker target for LeRobot v3 G1 datasets.
+
+task: g1_uncond_1cam_320_1e-4
+
+instance_count: 1
+queue: cv-spot
+
+channels:
+  g1:
+    s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/data/OmniEmbodied_Data
+    mode: File
+    distribution: FullyReplicated
+  pretrained:
+    s3: s3://tri-ml-sandbox-16011-us-west-2-datasets/junjie/fastwam/checkpoints
+    mode: File
+    distribution: FullyReplicated
+
+env:
+  DIFFSYNTH_MODEL_BASE_PATH: "{channel:pretrained}"
+  DIFFSYNTH_SKIP_DOWNLOAD: "true"
+  TOKENIZERS_PARALLELISM: "false"
+  HF_HOME: "/opt/ml/hf_cache"
+  HF_DATASETS_CACHE: "/opt/ml/hf_cache/datasets"
+  TORCH_HOME: "/opt/ml/torch_cache"
+
+overrides:
+  - "data.dataset_root={channel:g1}"
+  - "model.action_dit_pretrained_path={channel:pretrained}/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt"
+  - "output_dir={checkpoint_dir}/{task}"
+  - "wandb.name={job}"

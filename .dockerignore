@@ -1,0 +1,36 @@
+.git/
+.gitignore
+data/
+datasets/
+checkpoints/
+runs/
+evaluate_results/
+wandb/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.tar
+*.tar.gz
+*.mp4
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Credentials must never be baked into an image — sagemaker/Dockerfile does
+# `COPY . /opt/ml/code`, and that image gets pushed to ECR.
+.env
+.env.*
+*.pem
+*.key
+.aws/
+.netrc
+
+# RoboTwin simulation assets are for evaluation, not training, and are large
+# once downloaded. The policy/eval code itself stays in the image.
+third_party/RoboTwin/assets/
+third_party/RoboTwin/data/
+
