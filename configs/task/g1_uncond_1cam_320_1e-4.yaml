@@ -16,9 +16,9 @@ data:
 lr_scheduler_type: cosine
 learning_rate: 1e-4
 num_epochs: 5
-max_steps: 3000
+max_steps: 7500
 log_every: 10
-save_every: 1000
+save_every: 1500
 eval_every: 0
 eval_num_inference_steps: 10
 
