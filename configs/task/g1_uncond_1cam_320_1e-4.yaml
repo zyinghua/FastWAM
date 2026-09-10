@@ -10,7 +10,7 @@ num_workers: 4
 
 data:
   train:
-    num_frames: 81
+    num_frames: 33
   val: null
 
 lr_scheduler_type: cosine

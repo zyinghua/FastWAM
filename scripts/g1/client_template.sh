@@ -70,6 +70,11 @@ async def main():
         horizon = int(schema["action_horizon"])
         if horizon <= 0:
             raise ValueError(f"Expected a positive action horizon, got {horizon}.")
+        execute_horizon = int(metadata["control"]["execute_horizon"])
+        if not 1 <= execute_horizon <= horizon:
+            raise ValueError(
+                f"Expected execute horizon in [1, {horizon}], got {execute_horizon}."
+            )
 
         request = {
             "images": {
@@ -95,13 +100,15 @@ async def main():
             raise ValueError("Response contains non-finite actions.")
 
         parts = split_action(action)
+        execution_prefix = action[:execute_horizon]
         print("Response keys:", response.keys())
         print("Action shape:", action.shape)
+        print("Execution prefix shape:", execution_prefix.shape)
         print("Action dtype:", action.dtype)
         print("Motion-token / left-hand / right-hand shapes:", *(part.shape for part in parts))
         print("Action:\n", action)
-        # Robot-side code may execute a prefix, then request a fresh prediction
-        # from updated observations. This template only prints predictions.
+        # Robot-side code executes the advertised prefix, then replans from a
+        # fresh observation. This template only prints predictions.
 
 
 asyncio.run(main())

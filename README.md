@@ -477,9 +477,10 @@ bash scripts/g1/client_template.sh ws://127.0.0.1:8000 "pick up the container an
 
 The server selects FastWAM or JointWAM from the saved run config. The
 WebSocket/MessagePack interface matches RollingWAM's G1 workflow. Each method
-returns a fresh 32-action prediction for this task; a robot client can execute
-a prefix before replanning. The template uses synthetic observations and prints
-predictions without actuation.
+returns a fresh 32-action prediction for this task. The G1 serving wrapper
+advertises execution of the first 16 actions before replanning from a fresh
+observation. The template uses synthetic observations and prints predictions
+without actuation.
 
 See [the G1 guide](experiments/g1/README.md) for local checkpoint paths,
 dataset/cache overrides, normalization, resume, and robot-client integration.

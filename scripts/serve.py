@@ -32,6 +32,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--fps", type=float, required=True, help="Action execution frequency advertised to clients.")
+    parser.add_argument(
+        "--execute-horizon",
+        type=int,
+        default=None,
+        help="Number of predicted actions to execute before replanning; defaults to the full prediction horizon.",
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--default-instruction", default="", help="Used when a client omits or sends an empty text field.")
     parser.add_argument("--compile-action-infer", action="store_true", help="Enable FastWAM's existing compiled action inference path.")
@@ -64,6 +70,7 @@ def main() -> None:
         action_key=args.action_key,
         default_instruction=args.default_instruction,
         fps=args.fps,
+        execute_horizon=args.execute_horizon,
     )
     server = WebsocketPolicyServer(policy, host=args.host, port=args.port, metadata=policy.server_metadata())
     server.serve_forever()

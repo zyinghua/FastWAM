@@ -54,6 +54,7 @@ exec python scripts/serve.py \
   --state-key state \
   --action-key action \
   --fps 10 \
+  --execute-horizon 16 \
   --host 0.0.0.0 \
   --port 8000 \
   "$@"

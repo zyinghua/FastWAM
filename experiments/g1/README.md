@@ -294,22 +294,16 @@ action segments without changing their values. The robot client remains
 responsible for controller transport and actuation.
 
 The current FastWAM task predicts **32 actions per request**, covering 3.2
-seconds at 10 Hz. RollingWAM's current G1 task instead returns 8 actions from
-its rolling window. Always read
+seconds at 10 Hz. Always read
 `metadata["embodiments"][metadata["default_embodiment"]]["action_horizon"]`
-instead of hardcoding either length.
+instead of hardcoding the prediction length.
 
 FastWAM is stateless: every request makes a fresh prediction from its current
-image, state, and instruction. A robot client can execute a chosen prefix of
-the 32 actions, obtain new observations, and request a new prediction. It does
-not need to consume the whole horizon to keep a rolling cache synchronized.
-The metadata's `control.execute_horizon` and `control.replan_after_actions`
-advertise the full horizon by default; explicitly select the executed prefix
-in your robot-side control loop when using shorter replanning intervals. No
-part of this template sends action commands. The server allows one connected
-client at a time.
-
-For the same 0.8-second replanning interval as the current RollingWAM G1 setup
-at 10 Hz, execute the first 8 predicted rows, discard the remaining 24, and send
-a fresh observation. The prediction horizon remains 32; the executed prefix is
-a robot-client choice.
+image, state, and instruction. The G1 wrapper advertises an execution horizon
+of 16: execute the first 16 rows, discard the remaining 16, obtain a fresh
+observation, and request another 32-action prediction. At 10 Hz, this replans
+every 1.6 seconds. The generic server defaults to executing its full prediction
+horizon unless `--execute-horizon` is provided. Robot-side code should read
+`metadata["control"]["execute_horizon"]`; the template validates and prints that
+prefix but does not command the robot. The server allows one connected client
+at a time.

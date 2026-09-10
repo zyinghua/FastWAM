@@ -165,6 +165,7 @@ class FastWAMPolicy:
         concat_multi_camera: str | None = None,
         default_instruction: str = "",
         fps: float,
+        execute_horizon: int | None = None,
     ) -> None:
         self.model = model
         self.processor = processor
@@ -180,6 +181,9 @@ class FastWAMPolicy:
         self.embodiment = str(embodiment)
         self.default_instruction = str(default_instruction)
         self.fps = float(fps)
+        self.execute_horizon = (
+            self.action_horizon if execute_horizon is None else int(execute_horizon)
+        )
         self._lock = threading.RLock()
 
         if len(self.video_size) != 2 or min(self.video_size) < 1:
@@ -190,6 +194,11 @@ class FastWAMPolicy:
             raise ValueError("num_inference_steps must be positive.")
         if self.action_horizon < 1:
             raise ValueError("action_horizon must be positive.")
+        if not 1 <= self.execute_horizon <= self.action_horizon:
+            raise ValueError(
+                "execute_horizon must be between 1 and action_horizon, got "
+                f"{self.execute_horizon} for action_horizon={self.action_horizon}."
+            )
         if self._infer_uses_video_frames:
             if self.num_video_frames is None:
                 raise ValueError("This model requires num_video_frames from its training config.")
@@ -300,6 +309,7 @@ class FastWAMPolicy:
         action_key: str | None = None,
         default_instruction: str = "",
         fps: float,
+        execute_horizon: int | None = None,
     ) -> "FastWAMPolicy":
         checkpoint = Path(checkpoint_path).expanduser().resolve()
         if not checkpoint.is_file():
@@ -363,6 +373,7 @@ class FastWAMPolicy:
             concat_multi_camera=cfg.data.train.get("concat_multi_camera"),
             default_instruction=default_instruction,
             fps=fps,
+            execute_horizon=execute_horizon,
         )
 
     def _preprocess_image(
@@ -576,7 +587,7 @@ class FastWAMPolicy:
             },
             "control": {
                 "fps": self.fps,
-                "execute_horizon": horizon,
-                "replan_after_actions": horizon,
+                "execute_horizon": self.execute_horizon,
+                "replan_after_actions": self.execute_horizon,
             },
         }
