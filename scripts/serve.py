@@ -41,7 +41,25 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--default-instruction", default="", help="Used when a client omits or sends an empty text field.")
     parser.add_argument("--compile-action-infer", action="store_true", help="Enable FastWAM's existing compiled action inference path.")
-    return parser.parse_args()
+    parser.add_argument(
+        "--save-imagined-rollouts",
+        action="store_true",
+        help=(
+            "Append predicted frames to one server-side MP4 per session for FastWAM or JointWAM. "
+            "Disconnect, instruction change, or Ctrl+C finalizes the video."
+        ),
+    )
+    parser.add_argument(
+        "--imagined-dir",
+        default=None,
+        help="Server output directory; required with --save-imagined-rollouts.",
+    )
+    args = parser.parse_args()
+    if args.save_imagined_rollouts and (
+        args.imagined_dir is None or not args.imagined_dir.strip()
+    ):
+        parser.error("--imagined-dir is required with --save-imagined-rollouts")
+    return args
 
 
 def main() -> None:
@@ -71,9 +89,14 @@ def main() -> None:
         default_instruction=args.default_instruction,
         fps=args.fps,
         execute_horizon=args.execute_horizon,
+        save_imagined_rollouts=args.save_imagined_rollouts,
+        imagined_dir=args.imagined_dir,
     )
     server = WebsocketPolicyServer(policy, host=args.host, port=args.port, metadata=policy.server_metadata())
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        policy.reset()
 
 
 if __name__ == "__main__":

@@ -10,8 +10,15 @@ Examples (from the FastWAM repository):
   CUDA_VISIBLE_DEVICES=0 bash scripts/g1/serve_g1_policy.sh runs/RUN_ID/checkpoints/weights/step_000666.pt
   bash scripts/g1/serve_g1_policy.sh /models/g1.pt --config /models/config.yaml --dataset-stats /models/dataset_stats.json
   bash scripts/g1/serve_g1_policy.sh /models/g1.pt --host 127.0.0.1 --port 8001 --num-steps 10
+  bash scripts/g1/serve_g1_policy.sh /models/g1.pt --save-imagined-rollouts --imagined-dir /workspace/FastWAM/imagined_rollouts
 
 Loads config.yaml and dataset_stats.json from the checkpoint's run by default.
+The checkpoint config selects FastWAM or JointWAM; imagined recording supports both.
+Predicted frames append to one server-side MP4 per session. Disconnect, instruction
+change, or Ctrl+C finalizes the video.
+Recording keeps the configured execution prefix from each prediction at control FPS.
+FastWAM runs an extra video-generation pass; JointWAM decodes its existing latents.
+Recording adds inference latency; the action response and horizons are unchanged.
 Local Wan checkpoints default to ./checkpoints; downloads are disabled by default.
 Trailing server options override the G1 defaults. See experiments/g1/README.md.
 HELP

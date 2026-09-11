@@ -5,11 +5,14 @@ from __future__ import annotations
 import inspect
 import logging
 import math
+import tempfile
 import threading
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import imageio
 import numpy as np
 import torch
 import torchvision.transforms.functional as transforms_F
@@ -166,6 +169,8 @@ class FastWAMPolicy:
         default_instruction: str = "",
         fps: float,
         execute_horizon: int | None = None,
+        save_imagined_rollouts: bool = False,
+        imagined_dir: str | None = None,
     ) -> None:
         self.model = model
         self.processor = processor
@@ -185,10 +190,11 @@ class FastWAMPolicy:
             self.action_horizon if execute_horizon is None else int(execute_horizon)
         )
         self._lock = threading.RLock()
+        self.save_imagined_rollouts = bool(save_imagined_rollouts)
 
         if len(self.video_size) != 2 or min(self.video_size) < 1:
             raise ValueError(f"video_size must be positive [H,W], got {self.video_size}.")
-        if self.fps <= 0:
+        if not math.isfinite(self.fps) or self.fps <= 0:
             raise ValueError(f"fps must be positive, got {self.fps}.")
         if self.num_inference_steps < 1:
             raise ValueError("num_inference_steps must be positive.")
@@ -199,7 +205,7 @@ class FastWAMPolicy:
                 "execute_horizon must be between 1 and action_horizon, got "
                 f"{self.execute_horizon} for action_horizon={self.action_horizon}."
             )
-        if self._infer_uses_video_frames:
+        if self._infer_uses_video_frames or self.save_imagined_rollouts:
             if self.num_video_frames is None:
                 raise ValueError("This model requires num_video_frames from its training config.")
             if self.num_video_frames <= 1 or self.num_video_frames % 4 != 1:
@@ -289,6 +295,22 @@ class FastWAMPolicy:
             args={"img_h": self.video_size[0], "img_w": self.video_size[1]}
         )
         self._final_normalize = Normalize(args={"mean": 0.5, "std": 0.5})
+        self.imagined_dir: Path | None = None
+        self._imagined_writer = None
+        self._imagined_path: Path | None = None
+        self._imagined_chunks = 0
+        self._imagined_session = -1
+        self._active_instruction: str | None = None
+        if self.save_imagined_rollouts:
+            if imagined_dir is None or not str(imagined_dir).strip():
+                raise ValueError("imagined_dir is required when saving imagined rollouts.")
+            root = Path(imagined_dir).expanduser().resolve()
+            root.mkdir(parents=True, exist_ok=True)
+            self.imagined_dir = Path(tempfile.mkdtemp(
+                prefix=datetime.now().strftime("run_%Y%m%d_%H%M%S_"), dir=root,
+            ))
+            logger.info("Saving imagined rollouts to %s", self.imagined_dir)
+        self.reset()
 
     @classmethod
     def from_checkpoint(
@@ -310,6 +332,8 @@ class FastWAMPolicy:
         default_instruction: str = "",
         fps: float,
         execute_horizon: int | None = None,
+        save_imagined_rollouts: bool = False,
+        imagined_dir: str | None = None,
     ) -> "FastWAMPolicy":
         checkpoint = Path(checkpoint_path).expanduser().resolve()
         if not checkpoint.is_file():
@@ -374,6 +398,8 @@ class FastWAMPolicy:
             default_instruction=default_instruction,
             fps=fps,
             execute_horizon=execute_horizon,
+            save_imagined_rollouts=save_imagined_rollouts,
+            imagined_dir=imagined_dir,
         )
 
     def _preprocess_image(
@@ -547,6 +573,9 @@ class FastWAMPolicy:
             instruction = self._resolve_instruction(obs)
             input_image = self._preprocess_images(images)
             proprio = self._normalize_state(state)
+            if self._active_instruction is not None and instruction != self._active_instruction:
+                self.reset()
+            self._active_instruction = instruction
             prompt = DEFAULT_PROMPT.format(task=instruction)
             infer_kwargs = dict(
                 input_image=input_image,
@@ -559,11 +588,88 @@ class FastWAMPolicy:
             )
             if self._infer_uses_video_frames:
                 infer_kwargs["num_video_frames"] = self.num_video_frames
+                if self.save_imagined_rollouts:
+                    infer_kwargs["return_video_latents"] = True
             prediction = self.model.infer_action(**infer_kwargs)
-            return {self.action_key: self._denormalize_action(prediction["action"])}
+            action_np = self._denormalize_action(prediction["action"])
+            if self.save_imagined_rollouts:
+                # Keep the native action result independent of additional model work.
+                action_np = action_np.copy()
+                self._record_imagined_rollout(prediction, infer_kwargs)
+            return {self.action_key: action_np}
+
+    def _record_imagined_rollout(
+        self, prediction: Mapping[str, Any], infer_kwargs: Mapping[str, Any],
+    ) -> None:
+        """Append the executed prefix, resampled at control FPS, to this session's MP4."""
+        try:
+            device = torch.device(self.model.device)
+            rng_devices = []
+            if device.type == "cuda":
+                rng_devices = [device.index if device.index is not None else torch.cuda.current_device()]
+            # Extra video sampling must not change later seed=None action predictions.
+            with torch.random.fork_rng(devices=rng_devices):
+                if self._infer_uses_video_frames:
+                    # JointWAM already denoised these latents during action inference.
+                    frames = self.model._decode_latents(prediction["video_latents"])
+                else:
+                    # FastWAM's native action-only path remains unchanged, including
+                    # compilation. Generate video separately using its own attention mask.
+                    video_kwargs = dict(infer_kwargs)
+                    video_kwargs.update(
+                        num_video_frames=self.num_video_frames,
+                        test_action_with_infer_action=False,
+                        compile_action_infer=False,
+                    )
+                    frames = self.model.infer_joint(**video_kwargs)["video"]
+            if len(frames) != self.num_video_frames:
+                raise ValueError(
+                    f"Expected {self.num_video_frames} imagined frames, got {len(frames)}."
+                )
+            if self._imagined_writer is None:
+                self._imagined_path = self.imagined_dir / f"session{self._imagined_session:04d}.mp4"
+                self._imagined_writer = imageio.get_writer(
+                    str(self._imagined_path), fps=self.fps, codec="libx264",
+                    format="FFMPEG", pixelformat="yuv420p",
+                )
+                self._imagined_writer.append_data(np.asarray(frames[0], dtype=np.uint8))
+                logger.info("Recording imagined rollout to %s", self._imagined_path)
+            # Save only the portion the client is configured to execute before
+            # replanning. Hold frames when video is sampled slower than actions.
+            # Include the initial observation once, not at every chunk boundary.
+            for action_step in range(1, self.execute_horizon + 1):
+                frame_index = action_step * (self.num_video_frames - 1) // self.action_horizon
+                self._imagined_writer.append_data(np.asarray(frames[frame_index], dtype=np.uint8))
+            self._imagined_chunks += 1
+        except Exception:
+            logger.exception("Imagined rollout recording failed; disabling it for this server.")
+            self.save_imagined_rollouts = False
+            self._close_imagined_rollout()
+            try:
+                self.model.vae.model.clear_cache()
+            except Exception:
+                logger.debug("Could not clear VAE caches after recording failure.", exc_info=True)
+
+    def _close_imagined_rollout(self) -> None:
+        writer, path, chunks = self._imagined_writer, self._imagined_path, self._imagined_chunks
+        self._imagined_writer = None
+        self._imagined_path = None
+        self._imagined_chunks = 0
+        if writer is None:
+            return
+        try:
+            writer.close()
+            logger.info("Saved imagined rollout (%d chunks) to %s", chunks, path)
+        except Exception:
+            logger.exception("Could not finalize imagined rollout %s; disabling recording.", path)
+            self.save_imagined_rollouts = False
 
     def reset(self) -> None:
-        """Protocol compatibility: FastWAM keeps no observation/action stream state."""
+        """Finalize recording; FastWAM keeps no observation/action stream state."""
+        with self._lock:
+            self._close_imagined_rollout()
+            self._imagined_session += 1
+            self._active_instruction = None
 
     def server_metadata(self) -> dict[str, Any]:
         horizon = self.action_horizon
