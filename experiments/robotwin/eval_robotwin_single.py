@@ -222,6 +222,9 @@ def main(cfg: DictConfig):
     _append_override(overrides, "rand_device", cfg.EVALUATION.rand_device)
     _append_override(overrides, "tiled", cfg.EVALUATION.tiled)
     _append_override(overrides, "timing_enabled", cfg.EVALUATION.timing_enabled)
+    smoothness_dir = _resolve_optional_path(cfg.EVALUATION.get("smoothness_dir"), base=PROJECT_ROOT)
+    _append_override(overrides, "smoothness_dir", str(smoothness_dir) if smoothness_dir else None)
+    _append_override(overrides, "smoothness_method", cfg.EVALUATION.get("smoothness_method"))
     _append_override(
         overrides,
         "skip_get_obs_within_replan",

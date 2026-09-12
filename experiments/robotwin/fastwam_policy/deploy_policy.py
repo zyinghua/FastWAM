@@ -157,6 +157,9 @@ class WorldActionRobotWinPolicy:
         tiled: bool,
         timing_enabled: bool,
         num_video_frames: int,
+        smoothness_dir: Optional[Path] = None,
+        smoothness_method: Optional[str] = None,
+        smoothness_metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
@@ -182,6 +185,27 @@ class WorldActionRobotWinPolicy:
         self._num_video_frames = int(num_video_frames)
 
         self.pending_actions: deque[np.ndarray] = deque()
+        self.action_trace = None
+        if smoothness_dir is not None:
+            from fastwam.evaluation.smoothness.labels import resolve_method_label
+            from fastwam.evaluation.smoothness.robotwin import RoboTwinActionTrace
+
+            self.action_trace = RoboTwinActionTrace(
+                smoothness_dir,
+                method=resolve_method_label(self.model, smoothness_method),
+                metadata={
+                    "checkpoint": checkpoint_path,
+                    "dataset_stats": str(dataset_stats_path),
+                    "evaluation_seed": self.seed,
+                    "model_class": type(self.model).__name__,
+                    "action_horizon": self.action_horizon,
+                    "execute_horizon": self.replan_steps,
+                    "num_video_frames": self._num_video_frames,
+                    "num_inference_steps": self.num_inference_steps,
+                    **(smoothness_metadata or {}),
+                },
+            )
+            atexit.register(self.action_trace.close)
         self.episode_count = 0
         self.step_count = 0
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
@@ -282,6 +306,8 @@ class WorldActionRobotWinPolicy:
         return not self.pending_actions
 
     def step(self, task_env, observation: Optional[Dict[str, Any]]) -> None:
+        if self.action_trace is not None and self.action_trace.finish_if_terminal(task_env):
+            return
         if not self.pending_actions:
             if observation is None:
                 raise ValueError(
@@ -290,6 +316,8 @@ class WorldActionRobotWinPolicy:
                 )
             instruction = task_env.get_instruction()
             self._fill_action_queue(observation=observation, instruction=instruction)
+            if self.pending_actions and self.action_trace is not None:
+                self.action_trace.begin_chunk(task_env, instruction)
 
         if not self.pending_actions:
             logger.warning("No action generated; skip current eval step.")
@@ -297,7 +325,10 @@ class WorldActionRobotWinPolicy:
 
         action = self.pending_actions.popleft()
         sim_t0 = time.perf_counter() if self.timing_enabled else 0.0
-        task_env.take_action(action, action_type="qpos")
+        if self.action_trace is None:
+            task_env.take_action(action, action_type="qpos")
+        else:
+            self.action_trace.take_action(task_env, action)
         if self.timing_enabled:
             self._timing_rollout["sim_s"] += time.perf_counter() - sim_t0
         self.step_count += 1
@@ -330,6 +361,8 @@ class WorldActionRobotWinPolicy:
         self._replan_times = []
 
     def reset(self) -> None:
+        if self.action_trace is not None:
+            self.action_trace.reset()
         self.pending_actions.clear()
         self._log_replan_timing()
         self.episode_count += 1
@@ -394,6 +427,12 @@ def get_model(usr_args: Dict[str, Any]):
     timing_enabled = _parse_bool(
         usr_args.get("timing_enabled", cfg.EVALUATION.get("timing_enabled", False))
     )
+    smoothness_dir = usr_args.get("smoothness_dir")
+    if _is_none_like(smoothness_dir):
+        smoothness_dir = cfg.EVALUATION.get("smoothness_dir")
+    smoothness_method = usr_args.get("smoothness_method")
+    if _is_none_like(smoothness_method):
+        smoothness_method = cfg.EVALUATION.get("smoothness_method")
 
     policy = WorldActionRobotWinPolicy(
         model_cfg=cfg.model,
@@ -413,6 +452,17 @@ def get_model(usr_args: Dict[str, Any]):
         tiled=tiled,
         timing_enabled=timing_enabled,
         num_video_frames=(int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1,
+        smoothness_dir=(
+            None if _is_none_like(smoothness_dir)
+            else Path(str(smoothness_dir)).expanduser()
+        ),
+        smoothness_method=(None if _is_none_like(smoothness_method) else str(smoothness_method)),
+        smoothness_metadata={
+            "task": usr_args.get("task_name"),
+            "task_config": usr_args.get("task_config"),
+            "instruction_type": usr_args.get("instruction_type"),
+            "sim_task": sim_task,
+        },
     )
     return policy
 

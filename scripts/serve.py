@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import logging
 import sys
 from pathlib import Path
@@ -54,11 +55,28 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Server output directory; required with --save-imagined-rollouts.",
     )
+    parser.add_argument(
+        "--smoothness-dir",
+        default=None,
+        help=(
+            "Optional directory for denormalized predicted command prefixes and replan boundaries. "
+            "Records the advertised execution horizon; these are not confirmed robot commands."
+        ),
+    )
+    parser.add_argument(
+        "--smoothness-method",
+        default=None,
+        help="Optional trace label override; defaults to Fast-WAM, Joint-WAM, or IDM-WAM from the inference mode.",
+    )
     args = parser.parse_args()
     if args.save_imagined_rollouts and (
         args.imagined_dir is None or not args.imagined_dir.strip()
     ):
         parser.error("--imagined-dir is required with --save-imagined-rollouts")
+    if args.smoothness_dir is not None and not args.smoothness_dir.strip():
+        parser.error("--smoothness-dir must not be empty")
+    if args.smoothness_method is not None and not args.smoothness_method.strip():
+        parser.error("--smoothness-method must not be empty")
     return args
 
 
@@ -72,6 +90,24 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
+    action_trace_recorder = None
+    if args.smoothness_dir is not None:
+        from fastwam.evaluation.smoothness.recording import ActionTraceRecorder
+
+        action_trace_recorder = ActionTraceRecorder(
+            args.smoothness_dir,
+            # No file is created until inference; resolve auto after model loading.
+            method=args.smoothness_method or "auto",
+            embodiment=args.embodiment,
+            source="predicted_command",
+            metadata={
+                "checkpoint": str(Path(args.checkpoint).expanduser().resolve()),
+                "seed": args.seed,
+                "timestamp_semantics": "server_recording_time_not_execution_time",
+            },
+        )
+        atexit.register(action_trace_recorder.close)
+
     policy = FastWAMPolicy.from_checkpoint(
         args.checkpoint,
         dataset_stats_path=args.dataset_stats,
@@ -91,7 +127,14 @@ def main() -> None:
         execute_horizon=args.execute_horizon,
         save_imagined_rollouts=args.save_imagined_rollouts,
         imagined_dir=args.imagined_dir,
+        action_trace_recorder=action_trace_recorder,
     )
+    if action_trace_recorder is not None:
+        from fastwam.evaluation.smoothness.labels import resolve_method_label
+
+        action_trace_recorder.method = resolve_method_label(
+            policy.model, override=args.smoothness_method,
+        )
     server = WebsocketPolicyServer(policy, host=args.host, port=args.port, metadata=policy.server_metadata())
     try:
         server.serve_forever()

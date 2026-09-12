@@ -34,6 +34,10 @@ EVALUATION:
   tiled: false
   # Per-episode model-call latency: first replan, then mean/min/max of later replans.
   timing_enabled: false
+  # Opt-in recording of accepted joint targets before RoboTwin TOPP interpolation.
+  smoothness_dir: null
+  # null infers Fast-WAM, Joint-WAM, or IDM-WAM from the loaded model.
+  smoothness_method: null
   skip_get_obs_within_replan: true
 
   # Runtime inputs

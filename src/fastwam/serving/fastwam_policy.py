@@ -10,7 +10,7 @@ import threading
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import imageio
 import numpy as np
@@ -29,6 +29,9 @@ from fastwam.datasets.dataset_utils import (
 from fastwam.datasets.lerobot.text_cache import DEFAULT_PROMPT
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 from fastwam.utils.config_resolvers import register_default_resolvers
+
+if TYPE_CHECKING:
+    from fastwam.evaluation.smoothness.recording import ActionTraceRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +174,7 @@ class FastWAMPolicy:
         execute_horizon: int | None = None,
         save_imagined_rollouts: bool = False,
         imagined_dir: str | None = None,
+        action_trace_recorder: ActionTraceRecorder | None = None,
     ) -> None:
         self.model = model
         self.processor = processor
@@ -191,6 +195,10 @@ class FastWAMPolicy:
         )
         self._lock = threading.RLock()
         self.save_imagined_rollouts = bool(save_imagined_rollouts)
+        self._action_trace_recorder = action_trace_recorder
+        self._trace_episode_started = False
+        if action_trace_recorder is not None and action_trace_recorder.source != "predicted_command":
+            raise ValueError("Server action traces require source='predicted_command'.")
 
         if len(self.video_size) != 2 or min(self.video_size) < 1:
             raise ValueError(f"video_size must be positive [H,W], got {self.video_size}.")
@@ -334,6 +342,7 @@ class FastWAMPolicy:
         execute_horizon: int | None = None,
         save_imagined_rollouts: bool = False,
         imagined_dir: str | None = None,
+        action_trace_recorder: ActionTraceRecorder | None = None,
     ) -> "FastWAMPolicy":
         checkpoint = Path(checkpoint_path).expanduser().resolve()
         if not checkpoint.is_file():
@@ -400,6 +409,7 @@ class FastWAMPolicy:
             execute_horizon=execute_horizon,
             save_imagined_rollouts=save_imagined_rollouts,
             imagined_dir=imagined_dir,
+            action_trace_recorder=action_trace_recorder,
         )
 
     def _preprocess_image(
@@ -592,11 +602,35 @@ class FastWAMPolicy:
                     infer_kwargs["return_video_latents"] = True
             prediction = self.model.infer_action(**infer_kwargs)
             action_np = self._denormalize_action(prediction["action"])
+            self._record_action_chunk(action_np, instruction)
             if self.save_imagined_rollouts:
                 # Keep the native action result independent of additional model work.
                 action_np = action_np.copy()
                 self._record_imagined_rollout(prediction, infer_kwargs)
             return {self.action_key: action_np}
+
+    def _record_action_chunk(self, action: np.ndarray, instruction: str) -> None:
+        """Record the advertised prefix; the server cannot verify client execution."""
+        recorder = self._action_trace_recorder
+        if recorder is None:
+            return
+        if not self._trace_episode_started:
+            recorder.start_episode(metadata={
+                "task": instruction,
+                "instruction": instruction,
+                "fps": self.fps,
+                "num_inference_steps": self.num_inference_steps,
+                "actions_per_chunk": self.execute_horizon,
+                "prediction_horizon": self.action_horizon,
+                "execute_horizon": self.execute_horizon,
+                "capture": "advertised_execution_prefix",
+            })
+            self._trace_episode_started = True
+        recorder.start_chunk()
+        # The client may discard the prediction tail before replanning. Including
+        # it would measure a boundary the advertised command stream never reaches.
+        for row in action[:self.execute_horizon]:
+            recorder.record_action(row)
 
     def _record_imagined_rollout(
         self, prediction: Mapping[str, Any], infer_kwargs: Mapping[str, Any],
@@ -667,6 +701,9 @@ class FastWAMPolicy:
     def reset(self) -> None:
         """Finalize recording; FastWAM keeps no observation/action stream state."""
         with self._lock:
+            if self._action_trace_recorder is not None and self._trace_episode_started:
+                self._action_trace_recorder.finish_episode(success=None)
+                self._trace_episode_started = False
             self._close_imagined_rollout()
             self._imagined_session += 1
             self._active_instruction = None
