@@ -1,7 +1,7 @@
 """Boundary smoothness of one episode of executed action commands.
 
-These are action first and second differences, not physical velocity, acceleration,
-or jerk: their physical meaning depends on the action representation and timestep.
+These are action second differences, not physical acceleration or jerk: their
+physical meaning depends on the action representation and timestep.
 No temporal derivative or resampling is applied. Keep control rates and action
 representations matched when comparing policies.
 """
@@ -77,15 +77,14 @@ def measure_actions(
     by its positive ``scales`` entry (default: one). Magnitudes use L2 / sqrt(d)
     for that group's d dimensions. For z = actions / scales:
 
-      jump[b] = RMS(z[b] - z[b-1])
       c[t] = RMS((z[t+1] - z[t]) - (z[t] - z[t-1]))
-      curvature[b] = (c[b-1] + c[b]) / 2
+      boundary_second_difference[b] = (c[b-1] + c[b]) / 2
 
-    Boundary curvature is available only when both centers exist (b >= 2 and
+    A boundary score is available only when both centers exist (b >= 2 and
     b + 1 < T). Its two stencils may include another boundary for short chunks.
-    An interior jump uses two actions from one chunk; interior curvature uses
-    three actions from one chunk. Curvature is an action second difference,
-    rather than geometric curvature or a universally physical jerk measure.
+    An interior score uses three actions entirely from one chunk. This measures
+    changes in command increments; a large value can also reflect intentional
+    acceleration or reversal, rather than unwanted jitter.
 
     The ratio is the boundary mean divided by the corresponding interior mean.
     Missing statistics and ratios with interior means <= ``RATIO_EPS`` (1e-12,
@@ -146,8 +145,8 @@ def measure_actions(
 
     transitions = ids[1:] != ids[:-1]
     boundaries = np.flatnonzero(transitions) + 1
-    curvature_valid = (boundaries >= 2) & (boundaries + 1 < num_actions)
-    valid_boundaries = boundaries[curvature_valid]
+    boundary_valid = (boundaries >= 2) & (boundaries + 1 < num_actions)
+    valid_boundaries = boundaries[boundary_valid]
     interior_centers = (ids[:-2] == ids[1:-1]) & (ids[1:-1] == ids[2:])
     result = {
         "num_actions": int(num_actions),
@@ -157,26 +156,23 @@ def measure_actions(
         "groups": {},
     }
     for name, indices in checked_groups.items():
-        jumps = _rms(differences[:, indices])
-        curvature = _rms(second_differences[:, indices])
-        # curvature array index t-1 corresponds to the stencil centered at t.
-        boundary_curvature = (
-            curvature[valid_boundaries - 2] / 2
-            + curvature[valid_boundaries - 1] / 2
+        second_difference = _rms(second_differences[:, indices])
+        # second_difference array index t-1 corresponds to the stencil centered at t.
+        boundary_second_difference = (
+            second_difference[valid_boundaries - 2] / 2
+            + second_difference[valid_boundaries - 1] / 2
         )
         events = []
-        for b, valid in zip(boundaries, curvature_valid):
+        for b, valid in zip(boundaries, boundary_valid):
             events.append({
                 "index": int(b),
                 "chunk_id": int(ids[b]),
-                "jump": float(jumps[b - 1]),
-                "curvature": float(curvature[b - 2] / 2 + curvature[b - 1] / 2)
+                "second_difference": float(second_difference[b - 2] / 2 + second_difference[b - 1] / 2)
                 if valid else None,
             })
         result["groups"][name] = {
             "dimensions": indices,
-            "jump": _summary(jumps[transitions], jumps[~transitions]),
-            "curvature": _summary(boundary_curvature, curvature[interior_centers]),
+            "second_difference": _summary(boundary_second_difference, second_difference[interior_centers]),
             "boundary_events": events,
         }
     return result

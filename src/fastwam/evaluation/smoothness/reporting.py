@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from numbers import Integral
 import json
 from typing import Any
 
@@ -11,8 +12,7 @@ import numpy as np
 from .metrics import RATIO_EPS, _rms
 
 BASE_METRICS = (
-    "jump_boundary_mean", "jump_boundary_p95", "jump_interior_mean",
-    "curvature_boundary_mean", "curvature_boundary_p95", "curvature_interior_mean",
+    "second_difference_boundary_mean", "second_difference_boundary_p95", "second_difference_interior_mean",
 )
 
 
@@ -68,14 +68,15 @@ def flatten_episode(trace: dict[str, Any], measurement: dict[str, Any]) -> list[
             "num_boundaries": measurement["num_boundaries"],
             "success": trace["success"], "complete": trace["complete"],
         }
-        for metric in ("jump", "curvature"):
-            item = result[metric]
-            row[f"{metric}_boundary_mean"] = item["boundary"]["mean"]
-            row[f"{metric}_boundary_p95"] = item["boundary"]["p95"]
-            row[f"{metric}_interior_mean"] = item["interior"]["mean"]
-            row[f"{metric}_boundary_count"] = item["boundary"]["count"]
-            row[f"{metric}_interior_count"] = item["interior"]["count"]
-            row[f"{metric}_boundary_to_interior"] = item["ratio"]
+        item = result["second_difference"]
+        row.update(
+            second_difference_boundary_mean=item["boundary"]["mean"],
+            second_difference_boundary_p95=item["boundary"]["p95"],
+            second_difference_interior_mean=item["interior"]["mean"],
+            second_difference_boundary_count=item["boundary"]["count"],
+            second_difference_interior_count=item["interior"]["count"],
+            second_difference_boundary_to_interior=item["ratio"],
+        )
         rows.append(row)
     return rows
 
@@ -142,28 +143,32 @@ def summarize(rows: list[dict[str, Any]], *, bootstrap: int = 1000, seed: int = 
                 ) / len(eligible)
                 lo, hi = np.quantile(samples, [0.025, 0.975])
                 result[f"{label}_ci95_low"], result[f"{label}_ci95_high"] = float(lo), float(hi)
-        for metric in ("jump", "curvature"):
-            boundary_key, interior_key = f"{metric}_boundary_mean", f"{metric}_interior_mean"
-            paired = [[row for row in task if row[boundary_key] is not None and row[interior_key] is not None]
-                      for task in tasks]
-            numerator, _, n = _task_macro(paired, boundary_key)
-            denominator, _, _ = _task_macro(paired, interior_key)
-            result[f"{metric}_boundary_to_interior"] = _ratio(numerator, denominator)
-            result[f"{metric}_ratio_episodes"] = n
+        boundary_key = "second_difference_boundary_mean"
+        interior_key = "second_difference_interior_mean"
+        paired = [[row for row in task if row[boundary_key] is not None and row[interior_key] is not None]
+                  for task in tasks]
+        numerator, _, n = _task_macro(paired, boundary_key)
+        denominator, _, _ = _task_macro(paired, interior_key)
+        result["second_difference_boundary_to_interior"] = _ratio(numerator, denominator)
+        result["second_difference_ratio_episodes"] = n
         output.append(result)
     return output
 
 
 def boundary_profile(
-    trace: dict[str, Any], measurement: dict[str, Any], *, scales=None, radius: int = 5,
+    trace: dict[str, Any], measurement: dict[str, Any], *, scales=None, radius: int = 6,
 ) -> list[dict[str, Any]]:
     """Event-aligned values for plotting; offset 0 is the new chunk's first command.
 
-    A jump at index t connects t-1 to t. The second difference at index t uses
-    t-1,t,t+1. Consequently a boundary artifact can affect offsets -1 and 0.
-    Rows at another chunk boundary can appear for short execution horizons;
-    their IDs are retained so downstream plots can make the selection explicit.
+    Each second difference at index t uses t-1,t,t+1. Offsets are exported as
+    [-radius, radius), so radius 6 yields -6 through +5. The target boundary
+    crosses the stencils at offsets -1 and 0. ``crosses_boundary`` also marks
+    stencils crossing any other boundary for short execution horizons; those
+    must not be treated as within-chunk comparison points. Missing stencils
+    have a null score and ``is_within_chunk`` false.
     """
+    if not isinstance(radius, Integral) or isinstance(radius, (bool, np.bool_)) or radius < 1:
+        raise ValueError("radius must be a positive integer")
     actions = np.asarray(trace["actions"], dtype=np.float64)
     if scales is not None:
         actions = actions / np.asarray(scales)
@@ -173,19 +178,22 @@ def boundary_profile(
     task = str(metadata.get("task_name") or metadata.get("task") or metadata.get("instruction") or "unspecified")
     for name, group in measurement["groups"].items():
         selected = actions[:, group["dimensions"]]
-        first = _rms(np.diff(selected, axis=0))
         second = _rms(np.diff(selected, n=2, axis=0))
         for event in group["boundary_events"]:
             b = event["index"]
-            for offset in range(-radius, radius + 1):
+            for offset in range(-radius, radius):
                 t = b + offset
                 if not 0 <= t < len(actions):
                     continue
+                valid = 0 < t < len(actions) - 1
+                crosses_boundary = valid and not (ids[t - 1] == ids[t] == ids[t + 1])
                 rows.append({"episode_id": trace["episode_id"], "method": trace["method"],
                              "embodiment": trace["embodiment"], "source": trace["source"],
                              "group": name, "task": task, "boundary_index": b, "offset": offset,
                              "action_index": t, "chunk_id": int(ids[t]),
                              "is_boundary": bool(t > 0 and ids[t] != ids[t - 1]),
-                             "jump": None if t == 0 else float(first[t - 1]),
-                             "second_difference": float(second[t - 1]) if 0 < t < len(actions) - 1 else None})
+                             "crosses_boundary": bool(crosses_boundary),
+                             "crosses_target_boundary": bool(valid and offset in (-1, 0)),
+                             "is_within_chunk": bool(valid and not crosses_boundary),
+                             "second_difference": float(second[t - 1]) if valid else None})
     return rows

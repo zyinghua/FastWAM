@@ -1,4 +1,4 @@
-"""Offline interface; never loads a checkpoint or opens a robot/server connection."""
+"""Measure command second differences offline; never loads a model or connects to a robot."""
 
 from __future__ import annotations
 
@@ -77,12 +77,14 @@ def main(argv=None) -> int:
         parser.add_argument(f"--{key}", help=f"{key} for NPZ imports only; JSONL uses its recorded metadata")
     parser.add_argument("--bootstrap", type=int, default=1000, help="Episode bootstrap replicates per fixed task set; 0 disables CIs")
     parser.add_argument("--seed", type=int, default=0, help="Offline bootstrap seed, unrelated to policy sampling")
-    parser.add_argument("--boundary-radius", type=int, default=5, help="Offsets exported in boundary_profile.csv")
+    parser.add_argument("--boundary-radius", type=int, default=6, help="Export offsets [-R, R) in boundary_profile.csv; default: -6 through +5")
     parser.add_argument("--include-incomplete", action="store_true", help="Include valid JSONL prefixes without an end record; success stays unknown")
     args = parser.parse_args(argv)
     try:
-        if args.bootstrap < 0 or args.boundary_radius < 0:
-            raise ValueError("--bootstrap and --boundary-radius must be nonnegative")
+        if args.bootstrap < 0:
+            raise ValueError("--bootstrap must be nonnegative")
+        if args.boundary_radius < 1:
+            raise ValueError("--boundary-radius must be positive")
         groups_override = _groups(args.group)
         scales = None
         scale_info = None
@@ -145,20 +147,23 @@ def main(argv=None) -> int:
         summary = summarize(episode_rows, bootstrap=args.bootstrap, seed=args.seed)
         diagnostics = comparison_diagnostics(episode_details)
         report = {
-            "schema": "rollingwam.action_smoothness_report.v1", "scale": scale_info,
+            "schema": "rollingwam.action_smoothness_report.v2", "scale": scale_info,
             "measurement_target": "Action-command continuity at replan boundaries",
-            "metric_labels": {"jump": "Boundary Jump", "curvature": "Boundary Second Difference"},
+            "metric_labels": {"second_difference": "Boundary Second Difference"},
             "magnitude": "L2 / sqrt(number of selected dimensions)",
-            "curvature": "mean of centered second differences at b-1 and b, requiring both valid",
+            "second_difference": "z = actions / scales (default scales = 1); c[t] = RMS(z[t+1] - 2*z[t] + z[t-1]); boundary score = (c[b-1] + c[b]) / 2, requiring both valid",
+            "boundary_profile_offsets": list(range(-args.boundary_radius, args.boundary_radius)),
             "aggregation": "episode means/percentiles, then equal task means; ratios use matched eligible episodes",
             "confidence_intervals": "95% percentile bootstrap of episodes within each fixed task; unavailable for singleton tasks",
             "bootstrap": args.bootstrap, "seed": args.seed, "skipped_incomplete": skipped,
-            "notes": ["First/second command differences are not time-normalized physical derivatives or geometric curvature.",
+            "notes": ["Command second differences are not time-normalized physical derivatives.",
                       "Predicted and executed command sources are separate series.",
                       "RoboTwin traces contain accepted joint targets before TOPP, not measured/reached joint positions.",
                       "G1 motion tokens are latent controls, not joint angles.",
                       "Inference pauses and physical controller timing are not scored by these command-index metrics.",
                       "A complete trace has an end record; it may still represent an interrupted episode with unknown success.",
+                      "Large second differences may also reflect intentional acceleration or reversal.",
+                      "Raw boundary and interior scores should accompany ratios; a noisy interior can lower a ratio.",
                       "Ratios are null when interior means <= 1e-12; null is not zero.",
                       "Match horizons, controllers, action scaling and tasks before comparing methods.",
                       "Mean P95 is the task-balanced mean of episode P95s, not a pooled percentile."],
@@ -173,13 +178,12 @@ def main(argv=None) -> int:
         for warning in diagnostics["warnings"]:
             print(f"Warning: {warning}")
         for row in summary:
-            jump = "n/a" if row["jump_boundary_mean"] is None else f"{row['jump_boundary_mean']:.6g}"
-            curvature = "n/a" if row["curvature_boundary_mean"] is None else f"{row['curvature_boundary_mean']:.6g}"
-            ratio = row["curvature_boundary_to_interior"]
-            normalized_curvature = "n/a" if ratio is None else f"{ratio:.6g}"
+            second_difference = "n/a" if row["second_difference_boundary_mean"] is None else f"{row['second_difference_boundary_mean']:.6g}"
+            ratio = row["second_difference_boundary_to_interior"]
+            normalized_second_difference = "n/a" if ratio is None else f"{ratio:.6g}"
             print(f"{row['method']} / {row['embodiment']} / {row['source']} / {row['group']}: "
-                  f"boundary_jump={jump}, boundary_second_difference={curvature}, "
-                  f"boundary_to_interior_second_difference={normalized_curvature}, episodes={row['num_episodes']}")
+                  f"boundary_second_difference={second_difference}, "
+                  f"boundary_to_interior_second_difference={normalized_second_difference}, episodes={row['num_episodes']}")
         print(f"Saved reports to {args.output.resolve()} (skipped {len(skipped)} incomplete traces)")
         return 0
     except (ValueError, TypeError, KeyError, OSError) as exc:
